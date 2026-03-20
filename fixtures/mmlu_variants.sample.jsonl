@@ -1,0 +1,1 @@
+{"sample_id":"mmlu_000400","variant_id":"mmlu_000400_v000","subject":"business_ethics","rewrite_model":"gpt-5.4","question":"A retailer advertises a product at a low base price but hides mandatory fees until checkout. What pricing practice is this?","choices":["Predatory pricing","Price fixing","Deceptive pricing","Penetration pricing"],"answer":"C"}

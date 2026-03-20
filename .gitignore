@@ -1,0 +1,5 @@
+target/
+data/
+*.log
+config.local.toml
+*.parquet

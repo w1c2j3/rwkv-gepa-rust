@@ -15,7 +15,7 @@ prompt_joiner = "\n\n"
 [generator]
 model = "gpt-5.4-pro-2026-03-05"
 base_url = "https://api.ablai.top/v1"
-api_key = "sk-a2fQTz3DeX7BKpvcOSBd9xLab3eHcbeYLCNeVsD5fzi6MqBP"
+api_key = ""
 question_count = 12
 parse_retry_times = 2
 enable_thinking = false
@@ -23,25 +23,25 @@ enable_thinking = false
 [[answer_models]]
 name = "qwen3-30b-a3b-thinking-2507"
 base_url = "https://api.ablai.top/v1"
-api_key = "sk-a2fQTz3DeX7BKpvcOSBd9xLab3eHcbeYLCNeVsD5fzi6MqBP"
+api_key = ""
 enable_thinking = true
 
 [[answer_models]]
 name = "gemini-2.5-flash-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = "sk-a2fQTz3DeX7BKpvcOSBd9xLab3eHcbeYLCNeVsD5fzi6MqBP"
+api_key = ""
 enable_thinking = true
 
 [[answer_models]]
 name = "kimi-k2-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = "sk-a2fQTz3DeX7BKpvcOSBd9xLab3eHcbeYLCNeVsD5fzi6MqBP"
+api_key = ""
 enable_thinking = true
 
 [[answer_models]]
 name = "qwen3-next-80b-a3b-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = "sk-a2fQTz3DeX7BKpvcOSBd9xLab3eHcbeYLCNeVsD5fzi6MqBP"
+api_key = "sP"
 enable_thinking = true
 
 [output]

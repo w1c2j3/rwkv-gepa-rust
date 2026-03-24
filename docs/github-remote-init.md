@@ -35,5 +35,5 @@ git push -u origin main
 ```bash
 cargo fmt --check
 cargo test
-cargo run -- export --input fixtures/mmlu_variants.sample.jsonl --output /tmp/rust-v1.parquet
+cargo run -- export --input data/variants.jsonl --output /tmp/rust-v1.parquet
 ```

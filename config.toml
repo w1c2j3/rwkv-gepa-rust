@@ -1,6 +1,6 @@
 [input]
 local_jsonl_path = "data-worry.json"
-# limit = 10
+limit = 10
 start_index = 0
 default_subject = "general"
 sample_id_prefix = "sample"
@@ -13,35 +13,34 @@ ref_answer_path = "context.reference_target"
 prompt_joiner = "\n\n"
 
 [generator]
-model = "gpt-5.4-pro-2026-03-05"
+model = "gpt-5.4"
 base_url = "https://api.ablai.top/v1"
-api_key = ""
-question_count = 12
-parse_retry_times = 2
+api_key_env = "RWKV_GEPA_API_KEY"
+question_count = 10
 enable_thinking = false
 
 [[answer_models]]
 name = "qwen3-30b-a3b-thinking-2507"
 base_url = "https://api.ablai.top/v1"
-api_key = ""
+api_key_env = "RWKV_GEPA_API_KEY"
 enable_thinking = true
 
 [[answer_models]]
 name = "gemini-2.5-flash-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = ""
+api_key_env = "RWKV_GEPA_API_KEY"
 enable_thinking = true
 
 [[answer_models]]
 name = "kimi-k2-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = ""
+api_key_env = "RWKV_GEPA_API_KEY"
 enable_thinking = true
 
 [[answer_models]]
 name = "qwen3-next-80b-a3b-thinking"
 base_url = "https://api.ablai.top/v1"
-api_key = "sP"
+api_key_env = "RWKV_GEPA_API_KEY"
 enable_thinking = true
 
 [output]
@@ -49,13 +48,10 @@ jsonl = "data/rwkv_train.jsonl"
 
 [run]
 resume = true
-request_timeout_seconds = 120
-max_retries = 3
-retry_backoff_seconds = 2
-disable_env_proxy = false
+request_timeout_seconds = 240
+disable_env_proxy = true
 force_http1 = true
 
 [concurrency]
-# 0 means "use current job count"
-generator_requests = 0
-answer_requests = 0
+generator_requests = 8
+answer_requests = 32

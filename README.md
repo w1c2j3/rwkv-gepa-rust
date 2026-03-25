@@ -8,6 +8,7 @@
 - 从 `answer_models` 里稳定伪随机选一个可思维链模型生成 `assistant`
 - 最终只落一个 JSONL，直接用于训练
 - 运行时会显示 `generate` 和 `answer` 两段进度条
+- `answer` 阶段每成功一条都会立刻追加写入输出 JSONL，避免中途中断时整批结果丢失
 
 ```bash
 cargo run --release -- synthesize --config config.toml
@@ -110,7 +111,7 @@ ref_answer_path = "context.reference_target"
 输出示例：
 
 ```json
-{"generator_model":"gpt-5.4-pro-2026-03-05","answer_model":"qwen3-30b-a3b-thinking-2507","user":"Write a Rust function that streams a JSONL file and parses each line safely.","assistant":"<think>\n...\n</think>\n\nHere is a Rust implementation ...","record_id":"demo_001_q000","sample_id":"demo_001","subject":"coding","prompt":"You are a Rust expert.\n\nWrite a parser for JSONL.","ref_answer":"Use serde_json line by line."}
+{"generator_model":"gpt-5.4","answer_model":"qwen3-30b-a3b-thinking-2507","user":"Write a Rust function that streams a JSONL file and parses each line safely.","assistant":"<think>\n...\n</think>\n\nHere is a Rust implementation ...","record_id":"demo_001_q000","sample_id":"demo_001","subject":"coding","prompt":"You are a Rust expert.\n\nWrite a parser for JSONL.","ref_answer":"Use serde_json line by line."}
 ```
 
 这里不做“回答必须正确”的强校验。只要模型能产生有价值的回答，哪怕有错误，思维链本身也可以作为训练信号保留。
@@ -124,6 +125,7 @@ ref_answer_path = "context.reference_target"
 - `[generator]` 控制生成 `user` 的模型和数量
 - `generator.question_count` 是每个原始样本生成多少条训练样本
 - `[[answer_models]]` 可以写任意多个，只要外接接口支持
+- `api_key_env` 支持从环境变量读取密钥，优先建议这样配，不要把真实 token 写进仓库
 - `[output]` 现在只需要一个 `jsonl`
 - `[run]`、`[concurrency]` 都有默认值，不写会走内置默认配置
 - 如果代理环境下出现 TLS/握手异常，可先保持 `force_http1 = true`；如果你本机能直连外网，也可以设 `disable_env_proxy = true`

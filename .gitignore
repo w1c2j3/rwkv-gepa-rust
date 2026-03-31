@@ -1,5 +1,10 @@
 target/
 data/
 *.log
-config.local.toml
+config.*.toml
+mode.toml
+mode.*.toml
+!mode.example.toml
+.env
+.env.*
 *.parquet

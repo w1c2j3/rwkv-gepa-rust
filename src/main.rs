@@ -1,132 +1,108 @@
-use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Stdio};
-use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use reqwest::StatusCode;
+use reqwest::{Client, StatusCode};
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Map, Value, json};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command as TokioCommand;
+use serde_json::{Value, json};
+use serde_jsonlines::{append_json_lines, json_lines};
 
-#[rustfmt::skip]
 #[derive(Parser)]
-#[command(author, version, about = "Generic JSONL -> RWKV training data pipeline")]
-struct Cli { #[command(subcommand)] command: Command }
+#[command(author, version, about = "Lean JSONL -> RWKV training pipeline")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-#[rustfmt::skip]
 #[derive(Subcommand)]
 enum Command {
-    Synthesize { #[arg(long, default_value = "config.toml")] config: PathBuf, #[arg(long)] limit: Option<usize> },
-    Export { #[arg(long, default_value = "data/rwkv_train.jsonl")] input: PathBuf, #[arg(long, default_value = "data/rwkv_train.parquet")] output: PathBuf },
+    Synthesize {
+        #[arg(long, default_value = "mode.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
-    input: Input,
-    generator: Generator,
-    answer_models: Vec<Model>,
+    input: InputConfig,
+    generator: GeneratorConfig,
+    answer_models: Vec<ModelConfig>,
     #[serde(default)]
-    output: Output,
+    output: OutputConfig,
     #[serde(default)]
-    run: Run,
+    run: RunConfig,
     #[serde(default)]
-    concurrency: Concurrency,
+    concurrency: ConcurrencyConfig,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
-struct Input {
-    local_jsonl_path: PathBuf,
+#[serde(deny_unknown_fields)]
+struct InputConfig {
+    dataset_path: PathBuf,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     start_index: usize,
     #[serde(default = "default_subject")]
     default_subject: String,
-    #[serde(default = "default_sample_id_prefix")]
-    sample_id_prefix: String,
-    #[serde(default)]
-    sample_id_paths: Vec<String>,
-    #[serde(default = "default_sample_id_joiner")]
-    sample_id_joiner: String,
-    #[serde(default)]
-    sample_id_path: Option<String>,
-    #[serde(default)]
-    subject_paths: Vec<String>,
-    #[serde(default = "default_subject_joiner")]
-    subject_joiner: String,
-    #[serde(default)]
-    subject_path: Option<String>,
-    prompt_paths: Vec<String>,
-    ref_answer_path: String,
-    #[serde(default = "default_prompt_joiner")]
-    prompt_joiner: String,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
-struct Generator {
+#[serde(deny_unknown_fields)]
+struct GeneratorConfig {
     #[serde(flatten)]
-    model: Model,
-    question_count: usize,
+    model: ModelConfig,
+    variant_count: usize,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
-struct Model {
-    #[serde(alias = "model")]
-    name: String,
-    base_url: String,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    enable_thinking: bool,
+#[serde(deny_unknown_fields)]
+struct ModelConfig {
+    endpoint: String,
+    model_name: String,
+    api_key: String,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
+    #[serde(default)]
     reasoning_effort: Option<String>,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
 #[serde(default)]
-struct Output { jsonl: PathBuf }
+#[serde(deny_unknown_fields)]
+struct OutputConfig {
+    jsonl_path: PathBuf,
+}
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
 #[serde(default)]
-struct Run {
+#[serde(deny_unknown_fields)]
+struct RunConfig {
     resume: bool,
     request_timeout_seconds: f64,
     disable_env_proxy: bool,
     force_http1: bool,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Deserialize)]
 #[serde(default)]
-struct Concurrency {
-    generator_requests: usize,
+#[serde(deny_unknown_fields)]
+struct ConcurrencyConfig {
+    generate_requests: usize,
     answer_requests: usize,
 }
 
-#[rustfmt::skip]
 #[derive(Clone)]
 struct SourceSample {
     sample_id: String,
@@ -135,121 +111,109 @@ struct SourceSample {
     ref_answer: String,
 }
 
-#[rustfmt::skip]
 #[derive(Clone)]
-struct PendingRow {
-    record_id: String,
+struct GenerateJob {
+    sample: SourceSample,
+    missing_indices: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct PendingTask {
+    task_id: String,
     sample_id: String,
     subject: String,
     prompt: String,
     ref_answer: String,
     generator_model: String,
     user: String,
-    generator_usage: UsageStats,
 }
 
-#[rustfmt::skip]
 #[derive(Clone, Serialize, Deserialize)]
-struct TrainingRow {
+#[serde(deny_unknown_fields)]
+struct OutputRow {
+    task_id: String,
+    sample_id: String,
+    subject: String,
+    prompt: String,
+    ref_answer: String,
+    status: String,
     generator_model: String,
-    answer_model: String,
     user: String,
     assistant: String,
-    record_id: String,
-    sample_id: String,
-    subject: String,
-    prompt: String,
-    ref_answer: String,
-    #[serde(default, skip_serializing_if = "UsageStats::is_empty")]
-    generator_usage: UsageStats,
-    #[serde(default, skip_serializing_if = "UsageStats::is_empty")]
-    answer_usage: UsageStats,
+    text: String,
+    answer_model: String,
 }
 
-#[rustfmt::skip]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct UsageStats {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prompt_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completion_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    total_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reasoning_tokens: Option<u64>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunStatus {
+    Generated,
+    Done,
 }
 
-#[rustfmt::skip]
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
     messages: [ChatMessage<'a>; 1],
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    enable_thinking: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
-#[rustfmt::skip]
 #[derive(Serialize)]
-struct ChatMessage<'a> { role: &'a str, content: &'a str }
+struct ChatMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
 
-#[rustfmt::skip]
+#[derive(Clone, Copy, Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
 #[derive(Clone)]
-struct OpenAiClient { endpoint: String, api_key: String }
+struct OpenAiClient {
+    http: Client,
+    endpoint: String,
+    api_key: String,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ChatResult {
     content: String,
     reasoning: Option<String>,
-    usage: UsageStats,
 }
 
 #[derive(Debug)]
-struct ChatError {
-    kind: ChatErrorKind,
+struct RequestError {
+    transient: bool,
     message: String,
 }
 
-#[derive(Debug)]
-enum ChatErrorKind {
-    Http,
-    Api { status: StatusCode, body: String },
-    Parse,
-}
-
-struct GeneratedBatch {
-    rows: Vec<PendingRow>,
-    usage: UsageStats,
-}
-
-const CURL_HTTP_STATUS_MARKER: &str = "\n__CURL_HTTP_STATUS__:";
-
 #[tokio::main]
-#[rustfmt::skip]
-async fn main() -> ExitCode {
-    match match Cli::parse().command {
+async fn main() -> std::process::ExitCode {
+    let result = match Cli::parse().command {
         Command::Synthesize { config, limit } => synthesize(&config, limit).await,
-        Command::Export { input, output } => export_jsonl(&input, &output),
-    } {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => { eprintln!("{err:#}"); ExitCode::FAILURE }
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err:#}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
-#[rustfmt::skip]
 async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
     let mut cfg = load_config(path)?;
-    if limit.is_some() {
-        cfg.input.limit = limit;
+    if let Some(limit) = limit {
+        cfg.input.limit = Some(limit);
     }
-    ensure!(!cfg.answer_models.is_empty(), "need at least one answer model");
-    ensure!(cfg.generator.question_count > 0, "generator.question_count must be > 0");
-    ensure!(!cfg.input.prompt_paths.is_empty(), "input.prompt_paths must not be empty");
+    validate_config(&cfg)?;
 
     let samples = load_samples(&cfg)?;
     if samples.is_empty() {
@@ -258,428 +222,442 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
     }
 
     prepare_output(&cfg)?;
-
-    let existing_ids: HashSet<_> = if cfg.run.resume {
-        read_jsonl_if_exists::<TrainingRow>(&cfg.output.jsonl)?
-            .into_iter()
-            .map(|row| row.record_id)
-            .collect()
+    let resume_rows = if cfg.run.resume {
+        load_resume_rows(&cfg.output.jsonl_path)?
     } else {
-        HashSet::new()
+        HashMap::new()
     };
-
-    let total_samples = samples.len();
-    let generator_jobs = samples
-        .into_iter()
-        .filter(|sample| !sample_is_complete(sample, cfg.generator.question_count, &existing_ids))
-        .collect::<Vec<_>>();
-
-    let generator_client = OpenAiClient::new(
-        &cfg.generator.model.base_url,
-        resolve_api_key(&cfg.generator.model)?,
-    );
-    let generator = cfg.generator.clone();
-    let run = cfg.run.clone();
-    let generator_concurrency =
-        concurrency_limit(cfg.concurrency.generator_requests, generator_jobs.len());
-    let mut pending_rows = Vec::new();
-    let mut generator_usage_total = UsageStats::default();
-    let generator_pb = progress_bar(generator_jobs.len(), "generate");
-
-    let mut generator_stream = stream::iter(generator_jobs)
-        .map(|sample| {
-            let client = generator_client.clone();
-            let generator = generator.clone();
-            let run = run.clone();
-            async move { generate_questions(client, generator, run, sample).await }
-        })
-        .buffer_unordered(generator_concurrency);
-    while let Some(result) = generator_stream.next().await {
-        let batch = result?;
-        generator_usage_total.add_assign(&batch.usage);
-        pending_rows.extend(
-            batch
-                .rows
-                .into_iter()
-                .filter(|row| !existing_ids.contains(&row.record_id)),
+    if !resume_rows.is_empty() {
+        let (generated, done) = summarize_resume_rows(&resume_rows)?;
+        eprintln!(
+            "resuming with {} tracked tasks from {} (generated={}, done={})",
+            resume_rows.len(),
+            cfg.output.jsonl_path.display(),
+            generated,
+            done
         );
-        generator_pb.inc(1);
     }
-    generator_pb.finish_with_message("generate done");
 
-    if pending_rows.is_empty() {
-        println!("samples={total_samples} new_rows=0");
+    let (generator_jobs, mut pending_tasks) =
+        build_resume_plan(&samples, cfg.generator.variant_count, &resume_rows)?;
+    let mut generated_now = 0usize;
+    let resumed_generated = pending_tasks.len();
+    let mut skipped_generate = 0usize;
+
+    if !generator_jobs.is_empty() {
+        let client = OpenAiClient::new(&cfg.generator.model, &cfg.run)?;
+        let generator = cfg.generator.clone();
+        let pb = progress_bar(generator_jobs.len(), "generate");
+        let concurrency =
+            concurrency_limit(cfg.concurrency.generate_requests, generator_jobs.len());
+        let mut stream = stream::iter(generator_jobs)
+            .map(|job| {
+                let client = client.clone();
+                let generator = generator.clone();
+                async move { generate_tasks(client, generator, job).await }
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(tasks) => {
+                    let generated_rows = tasks.iter().map(generated_output_row).collect::<Vec<_>>();
+                    append_jsonl(&cfg.output.jsonl_path, &generated_rows)?;
+                    generated_now += tasks.len();
+                    for task in tasks {
+                        pending_tasks.push(task);
+                    }
+                }
+                Err(err) => {
+                    skipped_generate += 1;
+                    eprintln!("skipped generate job: {err:#}");
+                }
+            }
+            pb.inc(1);
+        }
+        pb.finish_with_message("generate done");
+    }
+
+    if pending_tasks.is_empty() {
+        println!(
+            "samples={} total_tasks={} new_tasks=0",
+            samples.len(),
+            samples.len() * cfg.generator.variant_count
+        );
         return Ok(());
     }
 
     let answer_clients = cfg
         .answer_models
         .iter()
-        .map(|model| Ok(OpenAiClient::new(&model.base_url, resolve_api_key(model)?)))
+        .map(|model| OpenAiClient::new(model, &cfg.run))
         .collect::<Result<Vec<_>>>()?;
-    let answers = cfg.answer_models.clone();
-    let run = cfg.run.clone();
-    let answer_concurrency = concurrency_limit(cfg.concurrency.answer_requests, pending_rows.len());
-    let generated_row_count = pending_rows.len();
+    let answer_models = cfg.answer_models.clone();
+    let answer_total = pending_tasks.len();
+    let answer_pb = progress_bar(answer_total, "answer");
+    let concurrency = concurrency_limit(cfg.concurrency.answer_requests, answer_total);
     let mut written = 0usize;
-    let mut answer_usage_total = UsageStats::default();
-    let answer_pb = progress_bar(pending_rows.len(), "answer");
+    let mut skipped_answer = 0usize;
 
-    let mut answer_stream = stream::iter(pending_rows)
-        .map(|row| {
-            let idx = pick_answer_model_index(&row, answers.len());
+    let mut stream = stream::iter(pending_tasks)
+        .map(|task| {
+            let idx = pick_model_index(&task.task_id, answer_models.len());
             let client = answer_clients[idx].clone();
-            let model = answers[idx].clone();
-            let run = run.clone();
-            async move { answer_row(client, model, run, row).await }
+            let model = answer_models[idx].clone();
+            async move { answer_task(client, model, task).await }
         })
-        .buffer_unordered(answer_concurrency);
-    while let Some(result) = answer_stream.next().await {
-        let row = result?;
-        answer_usage_total.add_assign(&row.answer_usage);
-        append_jsonl(&cfg.output.jsonl, std::slice::from_ref(&row))?;
-        written += 1;
+        .buffer_unordered(concurrency);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(row) => {
+                append_jsonl(&cfg.output.jsonl_path, std::slice::from_ref(&row))?;
+                written += 1;
+            }
+            Err(err) => {
+                skipped_answer += 1;
+                eprintln!("skipped answer task: {err:#}");
+            }
+        }
         answer_pb.inc(1);
     }
     answer_pb.finish_with_message("answer done");
 
     println!(
-        "samples={total_samples} generated={generated_row_count} written={written} generator_usage={} answer_usage={}",
-        generator_usage_total.summary(),
-        answer_usage_total.summary(),
+        "samples={} total_tasks={} resumed_generated={} generated_now={} answered_now={} skipped_generate={} skipped_answer={}",
+        samples.len(),
+        samples.len() * cfg.generator.variant_count,
+        resumed_generated,
+        generated_now,
+        written,
+        skipped_generate,
+        skipped_answer
     );
     Ok(())
 }
 
-#[rustfmt::skip]
-async fn generate_questions(client: OpenAiClient, generator: Generator, run: Run, sample: SourceSample) -> Result<GeneratedBatch> {
-    let prompt = build_generation_prompt(&sample, generator.question_count)?;
-    let structured_output = generator_response_format(generator.question_count);
-    let result = match client
-        .try_chat(
-            &generator.model.name,
-            &prompt,
-            &run,
-            generator.model.enable_thinking,
-            Some(&structured_output),
-            generator.model.max_completion_tokens,
-            generator.model.reasoning_effort.as_deref(),
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(err) if err.is_response_format_unsupported() => {
-            eprintln!(
-                "generator model {} does not support response_format; falling back to prompt-only JSON mode",
-                generator.model.name,
-            );
-            client
-                .try_chat(
-                    &generator.model.name,
-                    &prompt,
-                    &run,
-                    generator.model.enable_thinking,
-                    None,
-                    generator.model.max_completion_tokens,
-                    generator.model.reasoning_effort.as_deref(),
-                )
-                .await
-                .map_err(anyhow::Error::from)?
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let rows = parse_generated_questions(
-        &sample,
-        &generator.model.name,
-        generator.question_count,
-        &result.content,
-        result.usage.clone(),
-    )?;
-    Ok(GeneratedBatch {
-        rows,
-        usage: result.usage,
-    })
-}
-
-#[rustfmt::skip]
-async fn answer_row(client: OpenAiClient, model: Model, run: Run, row: PendingRow) -> Result<TrainingRow> {
+async fn generate_tasks(
+    client: OpenAiClient,
+    generator: GeneratorConfig,
+    job: GenerateJob,
+) -> Result<Vec<PendingTask>> {
+    let prompt = build_generation_prompt(&job.sample, generator.variant_count)?;
     let result = client
-        .chat(
-            &model.name,
-            &row.user,
-            &run,
-            model.enable_thinking,
-            None,
-            model.max_completion_tokens,
-            model.reasoning_effort.as_deref(),
-        )
+        .chat(&generator.model, &prompt, true)
         .await
-        .with_context(|| format!("answer model {} failed for record {}", model.name, row.record_id))?;
-    Ok(TrainingRow {
-        generator_model: row.generator_model,
-        answer_model: model.name,
-        user: row.user,
-        assistant: merge_assistant(result.reasoning, result.content),
-        record_id: row.record_id,
-        sample_id: row.sample_id,
-        subject: row.subject,
-        prompt: row.prompt,
-        ref_answer: row.ref_answer,
-        generator_usage: row.generator_usage,
-        answer_usage: result.usage,
+        .with_context(|| format!("generator failed for sample {}", job.sample.sample_id))?;
+    let users = parse_generated_users(&result.content, generator.variant_count)?;
+    job.missing_indices
+        .into_iter()
+        .map(|index| {
+            let user = users.get(index).cloned().ok_or_else(|| {
+                anyhow!(
+                    "missing generated variant {index} for {}",
+                    job.sample.sample_id
+                )
+            })?;
+            Ok(PendingTask {
+                task_id: task_id(&job.sample.sample_id, index),
+                sample_id: job.sample.sample_id.clone(),
+                subject: job.sample.subject.clone(),
+                prompt: job.sample.prompt.clone(),
+                ref_answer: job.sample.ref_answer.clone(),
+                generator_model: generator.model.model_name.clone(),
+                user,
+            })
+        })
+        .collect()
+}
+
+async fn answer_task(
+    client: OpenAiClient,
+    model: ModelConfig,
+    task: PendingTask,
+) -> Result<OutputRow> {
+    let result = client
+        .chat(&model, &task.user, false)
+        .await
+        .with_context(|| format!("answer failed for task {}", task.task_id))?;
+    let assistant = merge_assistant(result.reasoning, result.content);
+    let text = rwkv_text(&task.user, &assistant);
+    Ok(OutputRow {
+        task_id: task.task_id,
+        sample_id: task.sample_id,
+        subject: task.subject,
+        prompt: task.prompt,
+        ref_answer: task.ref_answer,
+        status: RunStatus::Done.as_str().to_owned(),
+        generator_model: task.generator_model,
+        user: task.user,
+        assistant,
+        text,
+        answer_model: model.model_name,
     })
 }
 
-#[rustfmt::skip]
 impl OpenAiClient {
-    fn new(base_url: &str, api_key: String) -> Self {
-        Self {
-            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
-            api_key,
-        }
-    }
-
-    async fn chat(&self, model: &str, prompt: &str, run: &Run, enable_thinking: bool, response_format: Option<&Value>, max_completion_tokens: Option<u32>, reasoning_effort: Option<&str>) -> Result<ChatResult> {
-        self.try_chat(
-            model,
-            prompt,
-            run,
-            enable_thinking,
-            response_format,
-            max_completion_tokens,
-            reasoning_effort,
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    async fn try_chat(&self, model: &str, prompt: &str, run: &Run, enable_thinking: bool, response_format: Option<&Value>, max_completion_tokens: Option<u32>, reasoning_effort: Option<&str>) -> std::result::Result<ChatResult, ChatError> {
-        let payload = serde_json::to_string(&ChatRequest {
-            model,
-            messages: [ChatMessage {
-                role: "user",
-                content: prompt,
-            }],
-            enable_thinking,
-            response_format,
-            max_completion_tokens,
-            reasoning_effort,
-        })
-        .map_err(|err| ChatError::parse(err.into()))?;
-
-        // Chat completions are not idempotent. A transport retry on a second
-        // client can duplicate spend, so live requests use a single curl path.
-        let (status, body) = self.try_chat_curl(&payload, run).await?;
-        self.finish_chat_response(status, body)
-    }
-
-    async fn try_chat_curl(&self, payload: &str, run: &Run) -> std::result::Result<(StatusCode, String), ChatError> {
-        let mut command = TokioCommand::new("curl");
-        command
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg("--connect-timeout")
-            .arg("15")
-            .arg("--max-time")
-            .arg(format!("{:.3}", run.request_timeout_seconds))
-            .arg("--request")
-            .arg("POST")
-            .arg("--header")
-            .arg("content-type: application/json")
-            .arg("--header")
-            .arg(format!("authorization: Bearer {}", self.api_key))
-            .arg("--data-binary")
-            .arg("@-")
-            .arg("--output")
-            .arg("-")
-            .arg("--write-out")
-            .arg(format!("{CURL_HTTP_STATUS_MARKER}%{{http_code}}"))
-            .arg(&self.endpoint);
-
+    fn new(model: &ModelConfig, run: &RunConfig) -> Result<Self> {
+        let mut builder =
+            Client::builder().timeout(Duration::from_secs_f64(run.request_timeout_seconds));
         if run.disable_env_proxy {
-            command.arg("--noproxy").arg("*");
+            builder = builder.no_proxy();
         }
         if run.force_http1 {
-            command.arg("--http1.1");
+            builder = builder.http1_only();
         }
-
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        let mut child = command
-            .spawn()
-            .map_err(|err| ChatError::http_message(format!("failed to spawn curl: {err}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(payload.as_bytes())
-                .await
-                .map_err(|err| ChatError::http_message(format!("failed to write curl request body: {err}")))?;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|err| ChatError::http_message(format!("failed to wait for curl: {err}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let message = stderr.trim();
-            let message = if message.is_empty() {
-                format!("curl exited with status {}", output.status)
-            } else {
-                format!("curl exited with status {}: {message}", output.status)
-            };
-            return Err(ChatError::http_message(message));
-        }
-
-        split_curl_response(&String::from_utf8_lossy(&output.stdout))
+        Ok(Self {
+            http: builder.build()?,
+            endpoint: model.endpoint.clone(),
+            api_key: model.api_key.clone(),
+        })
     }
 
-    fn finish_chat_response(&self, status: StatusCode, body: String) -> std::result::Result<ChatResult, ChatError> {
-        if !status.is_success() {
-            return Err(ChatError::api(status, body));
+    async fn chat(
+        &self,
+        model: &ModelConfig,
+        prompt: &str,
+        json_output: bool,
+    ) -> Result<ChatResult> {
+        let max_attempts = 3usize;
+        for attempt in 0..max_attempts {
+            match self.try_chat(model, prompt, json_output).await {
+                Ok(result) => return Ok(result),
+                Err(err) if err.transient && attempt + 1 < max_attempts => {
+                    eprintln!(
+                        "transient chat error for model {} (attempt {}/{}): {}",
+                        model.model_name,
+                        attempt + 1,
+                        max_attempts,
+                        err
+                    );
+                    tokio::time::sleep(Duration::from_secs((attempt + 1) as u64 * 2)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
+        unreachable!("chat retry loop should either return or fail")
+    }
 
-        let result =
-            parse_model_response(&body).with_context(|| response_preview_error(&body)).map_err(ChatError::parse)?;
-        if result.content.is_empty() && result.reasoning.is_none() {
-            return Err(ChatError::parse(anyhow!("empty model response")));
+    async fn try_chat(
+        &self,
+        model: &ModelConfig,
+        prompt: &str,
+        json_output: bool,
+    ) -> std::result::Result<ChatResult, RequestError> {
+        let body = self.send_chat_request(model, prompt, json_output).await?;
+        parse_chat_result(&body).map_err(RequestError::parse)
+    }
+
+    async fn send_chat_request(
+        &self,
+        model: &ModelConfig,
+        prompt: &str,
+        json_output: bool,
+    ) -> std::result::Result<String, RequestError> {
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&chat_request(model, prompt, json_output))
+            .send()
+            .await
+            .map_err(RequestError::http)?;
+        let status = response.status();
+        let body = response.text().await.map_err(RequestError::http)?;
+        if !status.is_success() {
+            return Err(RequestError::api(status, body));
         }
-        Ok(result)
+        Ok(body)
+    }
+}
+
+impl RequestError {
+    fn http(err: reqwest::Error) -> Self {
+        Self {
+            transient: err.is_timeout() || err.is_connect() || err.is_body(),
+            message: err.to_string(),
+        }
+    }
+
+    fn api(status: StatusCode, body: String) -> Self {
+        Self {
+            transient: status.is_server_error() || status.as_u16() == 429,
+            message: format!(
+                "chat completion failed with status {}: {}",
+                status,
+                preview_text(&body, 400)
+            ),
+        }
+    }
+
+    fn parse(err: anyhow::Error) -> Self {
+        Self {
+            transient: false,
+            message: err.to_string(),
+        }
+    }
+}
+
+impl Display for RequestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+fn chat_request<'a>(model: &'a ModelConfig, prompt: &'a str, json_output: bool) -> ChatRequest<'a> {
+    ChatRequest {
+        model: &model.model_name,
+        messages: [ChatMessage {
+            role: "user",
+            content: prompt,
+        }],
+        max_completion_tokens: model.max_completion_tokens,
+        reasoning_effort: model.reasoning_effort.as_deref(),
+        response_format: json_output.then(json_object_response_format),
+    }
+}
+
+fn json_object_response_format() -> ResponseFormat {
+    ResponseFormat {
+        kind: "json_object",
     }
 }
 
 fn load_config(path: &Path) -> Result<Config> {
     let mut cfg: Config = toml::from_str(&fs::read_to_string(path)?)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    cfg.input.local_jsonl_path = resolve(base, &cfg.input.local_jsonl_path);
-    cfg.output.jsonl = resolve(base, &cfg.output.jsonl);
+    cfg.input.dataset_path = resolve(base, &cfg.input.dataset_path);
+    cfg.output.jsonl_path = resolve(base, &cfg.output.jsonl_path);
     Ok(cfg)
 }
 
-fn load_samples(cfg: &Config) -> Result<Vec<SourceSample>> {
-    let mut samples = Vec::new();
-    let rows = load_input_rows(&cfg.input.local_jsonl_path)?;
-    for (index, value) in rows.into_iter().enumerate().skip(cfg.input.start_index) {
-        if cfg.input.limit.is_some_and(|limit| samples.len() >= limit) {
-            break;
-        }
-        samples.push(normalize_sample(&cfg.input, index, value)?);
+fn validate_config(cfg: &Config) -> Result<()> {
+    ensure!(
+        cfg.generator.variant_count > 0,
+        "generator.variant_count must be > 0"
+    );
+    ensure!(
+        !cfg.answer_models.is_empty(),
+        "need at least one answer model"
+    );
+    validate_model(&cfg.generator.model)?;
+    for model in &cfg.answer_models {
+        validate_model(model)?;
     }
-    Ok(samples)
+    Ok(())
 }
 
-fn normalize_sample(input: &Input, index: usize, value: Value) -> Result<SourceSample> {
-    let sample_id = joined_text(&value, &input.sample_id_paths, &input.sample_id_joiner)
-        .or_else(|| {
-            input
-                .sample_id_path
-                .as_deref()
-                .and_then(|path| extract_text(&value, path))
-        })
-        .unwrap_or_else(|| format!("{}_{index:06}", input.sample_id_prefix));
-    let subject = joined_text(&value, &input.subject_paths, &input.subject_joiner)
-        .or_else(|| {
-            input
-                .subject_path
-                .as_deref()
-                .and_then(|path| extract_text(&value, path))
-        })
-        .unwrap_or_else(|| input.default_subject.clone());
-    let prompt_parts = input
-        .prompt_paths
-        .iter()
-        .filter_map(|path| extract_text(&value, path))
-        .collect::<Vec<_>>();
+fn validate_model(model: &ModelConfig) -> Result<()> {
     ensure!(
-        !prompt_parts.is_empty(),
-        "missing prompt parts for sample {sample_id}"
+        !model.endpoint.trim().is_empty(),
+        "model endpoint must not be empty"
     );
-    let ref_answer = extract_text(&value, &input.ref_answer_path)
-        .ok_or_else(|| anyhow!("missing ref_answer for sample {sample_id}"))?;
+    ensure!(
+        !model.model_name.trim().is_empty(),
+        "model_name must not be empty"
+    );
+    ensure!(
+        !model.api_key.trim().is_empty(),
+        "api_key must not be empty"
+    );
+    Ok(())
+}
+
+fn load_samples(cfg: &Config) -> Result<Vec<SourceSample>> {
+    let mut out = Vec::new();
+    let mut invalid_count = 0usize;
+    let mut invalid_examples = Vec::new();
+    for (index, value) in load_input_rows_window(
+        &cfg.input.dataset_path,
+        cfg.input.start_index,
+        cfg.input.limit,
+    )? {
+        match normalize_sample(&cfg.input, index, value) {
+            Ok(sample) => out.push(sample),
+            Err(err) => {
+                invalid_count += 1;
+                if invalid_examples.len() < 5 {
+                    invalid_examples.push(format!("sample_index={index}: {err}"));
+                }
+            }
+        }
+    }
+    if invalid_count > 0 {
+        let preview = if invalid_examples.is_empty() {
+            String::new()
+        } else {
+            format!(" examples: {}", invalid_examples.join(" | "))
+        };
+        eprintln!(
+            "skipped {invalid_count} invalid normalized samples from {}{preview}",
+            cfg.input.dataset_path.display()
+        );
+    }
+    Ok(out)
+}
+
+fn normalize_sample(input: &InputConfig, _index: usize, value: Value) -> Result<SourceSample> {
+    let task_id = required_top_level_text(&value, "task_id")?;
+    let sample_index = required_top_level_text(&value, "sample_index")?;
+    let completions_id = required_top_level_text(&value, "completions_id")?;
+    let prompt = required_top_level_text(&value, "context")?;
+    let ref_answer = required_top_level_text(&value, "ref_answer")?;
     Ok(SourceSample {
-        sample_id,
-        subject,
-        prompt: prompt_parts.join(&input.prompt_joiner),
+        sample_id: format!("{task_id}_{sample_index}_{completions_id}"),
+        subject: input.default_subject.clone(),
+        prompt,
         ref_answer,
     })
 }
 
-fn parse_generated_questions(
-    sample: &SourceSample,
-    generator_model: &str,
-    n: usize,
-    text: &str,
-    usage: UsageStats,
-) -> Result<Vec<PendingRow>> {
-    let mut items = extract_json_array(parse_json_value(text)?)?;
-    ensure!(
-        items.len() >= n,
-        "expected at least {n} generated questions, got {}",
-        items.len()
-    );
-    items.truncate(n);
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(i, value)| {
-            let user = generated_user_text(value)?;
-            Ok(PendingRow {
-                record_id: record_id(&sample.sample_id, i),
-                sample_id: sample.sample_id.clone(),
-                subject: sample.subject.clone(),
-                prompt: sample.prompt.clone(),
-                ref_answer: sample.ref_answer.clone(),
-                generator_model: generator_model.to_owned(),
-                user,
-                generator_usage: usage.clone(),
-            })
-        })
-        .collect()
-}
+fn build_resume_plan(
+    samples: &[SourceSample],
+    variant_count: usize,
+    resume_rows: &HashMap<String, OutputRow>,
+) -> Result<(Vec<GenerateJob>, Vec<PendingTask>)> {
+    let mut generator_jobs = Vec::new();
+    let mut pending_tasks = Vec::new();
 
-fn extract_json_array(value: Value) -> Result<Vec<Value>> {
-    match value {
-        Value::Array(items) => Ok(items),
-        Value::Object(mut map) => {
-            for key in ["items", "questions", "users", "data"] {
-                if let Some(Value::Array(items)) = map.remove(key) {
-                    return Ok(items);
-                }
+    for sample in samples {
+        let mut missing_indices = Vec::new();
+        for index in 0..variant_count {
+            let id = task_id(&sample.sample_id, index);
+            match resume_rows.get(&id) {
+                Some(row) => match parse_row_status(row)? {
+                    RunStatus::Done => {}
+                    RunStatus::Generated => {
+                        pending_tasks.push(pending_task_from_output_row(row)?);
+                    }
+                },
+                None => missing_indices.push(index),
             }
-            bail!("expected JSON array")
         }
-        _ => bail!("expected JSON array"),
+        if !missing_indices.is_empty() {
+            generator_jobs.push(GenerateJob {
+                sample: sample.clone(),
+                missing_indices,
+            });
+        }
     }
+
+    Ok((generator_jobs, pending_tasks))
 }
 
-fn generated_user_text(value: Value) -> Result<String> {
-    let user = match value {
-        Value::String(text) => text.trim().to_owned(),
-        Value::Object(map) => ["user", "question", "prompt"]
-            .into_iter()
-            .filter_map(|key| map.get(key).and_then(value_to_text))
-            .next()
-            .unwrap_or_default(),
-        other => value_to_text(&other).unwrap_or_default(),
-    };
-    ensure!(!user.is_empty(), "generated user prompt is empty");
-    Ok(user)
-}
-
-fn build_generation_prompt(sample: &SourceSample, question_count: usize) -> Result<String> {
+fn build_generation_prompt(sample: &SourceSample, variant_count: usize) -> Result<String> {
     Ok(format!(
-        "You are generating RWKV training inputs.\n\
-Generate {question_count} different user prompts based on the source task.\n\
-Requirements:\n\
-- Each item must be a standalone user message.\n\
-- Do not assume the task is multiple-choice.\n\
-- It can be instruction following, coding, extraction, transformation, reasoning, or any nearby task that matches the source prompt.\n\
-- Return only JSON.\n\
-- Use this exact shape: {{\"questions\":[{{\"user\":\"...\"}}]}}.\n\
-- Include exactly {question_count} items in `questions`.\n\n\
-Source:\n{}",
+        "You are rewriting user questions for RWKV training.\n\
+Return only JSON.\n\
+The response must be a single JSON object with exactly one key named \"questions\".\n\
+The value of \"questions\" must be an array of exactly {variant_count} objects.\n\
+Each object must have exactly one key named \"user\".\n\
+Each \"user\" value must be a standalone rewritten user question.\n\
+Do not answer the question.\n\
+Do not include markdown, code fences, commentary, or extra keys.\n\n\
+Source task:\n{}",
         serde_json::to_string_pretty(&json!({
+            "sample_id": sample.sample_id,
             "subject": sample.subject,
             "prompt": sample.prompt,
             "ref_answer": sample.ref_answer,
@@ -687,131 +665,167 @@ Source:\n{}",
     ))
 }
 
-fn export_jsonl(input: &Path, output: &Path) -> Result<()> {
-    let rows = read_jsonl::<TrainingRow>(input)?;
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let schema = Schema::new(vec![
-        Field::new("generator_model", DataType::Utf8, false),
-        Field::new("answer_model", DataType::Utf8, false),
-        Field::new("user", DataType::Utf8, false),
-        Field::new("assistant", DataType::Utf8, false),
-        Field::new("record_id", DataType::Utf8, false),
-        Field::new("sample_id", DataType::Utf8, false),
-        Field::new("subject", DataType::Utf8, false),
-        Field::new("prompt", DataType::Utf8, false),
-        Field::new("ref_answer", DataType::Utf8, false),
-        Field::new("generator_prompt_tokens", DataType::UInt64, true),
-        Field::new("generator_completion_tokens", DataType::UInt64, true),
-        Field::new("generator_total_tokens", DataType::UInt64, true),
-        Field::new("generator_reasoning_tokens", DataType::UInt64, true),
-        Field::new("answer_prompt_tokens", DataType::UInt64, true),
-        Field::new("answer_completion_tokens", DataType::UInt64, true),
-        Field::new("answer_total_tokens", DataType::UInt64, true),
-        Field::new("answer_reasoning_tokens", DataType::UInt64, true),
-    ]);
-    let batch = RecordBatch::try_new(
-        Arc::new(schema.clone()),
-        vec![
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.generator_model),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.answer_model),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| &r.user))) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.assistant),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.record_id),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.sample_id),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.subject),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.prompt),
-            )) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|r| &r.ref_answer),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.generator_usage.prompt_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.generator_usage.completion_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.generator_usage.total_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.generator_usage.reasoning_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.answer_usage.prompt_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.answer_usage.completion_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.answer_usage.total_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.answer_usage.reasoning_tokens)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-        ],
-    )?;
-    let mut writer = ArrowWriter::try_new(
-        File::create(output)?,
-        Arc::new(schema),
-        Some(
-            WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
-                .build(),
-        ),
-    )?;
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+fn parse_generated_users(text: &str, expected: usize) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_str(text).context("generator did not return valid JSON")?;
+    let items = value
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("generator response must be an object with questions[]"))?;
+    collect_users(items, expected)
 }
 
-fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+fn collect_users(items: &[Value], expected: usize) -> Result<Vec<String>> {
+    ensure!(
+        items.len() == expected,
+        "expected exactly {expected} generated questions, got {}",
+        items.len()
+    );
+    items.iter().map(generated_user_text).collect()
+}
+
+fn generated_user_text(value: &Value) -> Result<String> {
+    let user = value
+        .get("user")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    ensure!(!user.is_empty(), "generated user prompt is empty");
+    Ok(user)
+}
+
+fn parse_chat_result(body: &str) -> Result<ChatResult> {
+    let value = serde_json::from_str::<Value>(body)?;
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| anyhow!("chat response is missing choices[0]"))?;
+    let message = choice
+        .get("message")
+        .ok_or_else(|| anyhow!("chat response is missing choices[0].message"))?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    ensure!(
+        !content.is_empty() || reasoning.is_some(),
+        "chat response is empty"
+    );
+    Ok(ChatResult { content, reasoning })
+}
+
+fn merge_assistant(reasoning: Option<String>, content: String) -> String {
+    match (reasoning.map(|text| text.trim().to_owned()), content.trim()) {
+        (Some(reasoning), "") => format!("<think>\n{reasoning}\n</think>"),
+        (Some(reasoning), content) => format!("<think>\n{reasoning}\n</think>\n\n{content}"),
+        (None, content) => content.to_owned(),
+    }
+}
+
+fn rwkv_text(user: &str, assistant: &str) -> String {
+    format!("User: {}\nAssistant: {}", user.trim(), assistant.trim())
+}
+
+fn generated_output_row(task: &PendingTask) -> OutputRow {
+    OutputRow {
+        task_id: task.task_id.clone(),
+        sample_id: task.sample_id.clone(),
+        subject: task.subject.clone(),
+        prompt: task.prompt.clone(),
+        ref_answer: task.ref_answer.clone(),
+        status: RunStatus::Generated.as_str().to_owned(),
+        generator_model: task.generator_model.clone(),
+        user: task.user.clone(),
+        assistant: String::new(),
+        text: String::new(),
+        answer_model: String::new(),
+    }
+}
+
+fn task_id(sample_id: &str, variant_index: usize) -> String {
+    format!("{sample_id}_q{variant_index:03}")
+}
+
+fn pick_model_index(task_id: &str, count: usize) -> usize {
+    let mut hasher = FxHasher::default();
+    task_id.hash(&mut hasher);
+    (hasher.finish() as usize) % count
+}
+
+fn load_input_rows_window(
+    path: &Path,
+    start_index: usize,
+    limit: Option<usize>,
+) -> Result<Vec<(usize, Value)>> {
+    let take_limit = limit.unwrap_or(usize::MAX);
+    if take_limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            out.push(serde_json::from_str(line.trim())?);
+    let mut logical_index = 0usize;
+    let mut skipped = 0usize;
+    let mut examples = Vec::new();
+    for (line_no, item) in json_lines::<Value, _>(path)?.enumerate() {
+        if out.len() >= take_limit {
+            break;
         }
+        let value = match item {
+            Ok(value) => value,
+            Err(err) => {
+                skipped += 1;
+                if examples.len() < 5 {
+                    examples.push(format!("line {}: {err}", line_no + 1));
+                }
+                continue;
+            }
+        };
+        if logical_index >= start_index {
+            out.push((logical_index, value));
+        }
+        logical_index += 1;
+    }
+    if skipped > 0 {
+        let preview = if examples.is_empty() {
+            String::new()
+        } else {
+            format!(" examples: {}", examples.join(" | "))
+        };
+        eprintln!(
+            "skipped {skipped} invalid input JSONL lines in {}{preview}",
+            path.display()
+        );
     }
     Ok(out)
 }
 
-fn read_jsonl_if_exists<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    if path.exists() {
-        read_jsonl(path)
-    } else {
-        Ok(Vec::new())
+fn read_jsonl<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for (line_no, item) in json_lines::<T, _>(path)?.enumerate() {
+        out.push(item.with_context(|| {
+            format!(
+                "invalid {label} JSONL line {} in {}",
+                line_no + 1,
+                path.display()
+            )
+        })?);
     }
+    Ok(out)
+}
+
+fn read_jsonl_if_exists<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    read_jsonl(path, label)
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
@@ -821,40 +835,16 @@ fn append_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    ensure_trailing_newline(path)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    for row in rows {
-        serde_json::to_writer(&mut file, row)?;
-        file.write_all(b"\n")?;
-    }
+    append_json_lines(path, rows.iter())?;
     Ok(())
 }
 
 fn prepare_output(cfg: &Config) -> Result<()> {
-    if let Some(parent) = cfg.output.jsonl.parent() {
+    if let Some(parent) = cfg.output.jsonl_path.parent() {
         fs::create_dir_all(parent)?;
     }
     if !cfg.run.resume {
-        File::create(&cfg.output.jsonl)?;
-    }
-    Ok(())
-}
-
-fn ensure_trailing_newline(path: &Path) -> Result<()> {
-    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    if file.metadata()?.len() == 0 {
-        return Ok(());
-    }
-    file.seek(SeekFrom::End(-1))?;
-    let mut tail = [0; 1];
-    file.read_exact(&mut tail)?;
-    if tail[0] != b'\n' {
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(b"\n")?;
+        File::create(&cfg.output.jsonl_path)?;
     }
     Ok(())
 }
@@ -867,116 +857,73 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn parse_json_value(text: &str) -> Result<Value> {
-    if let Ok(value) = serde_json::from_str::<Value>(text) {
-        return Ok(value);
+fn load_resume_rows(path: &Path) -> Result<HashMap<String, OutputRow>> {
+    let mut rows = HashMap::new();
+    for row in read_jsonl_if_exists::<OutputRow>(path, "output")? {
+        rows.insert(row.task_id.clone(), row);
     }
-    for (open, close) in [('[', ']'), ('{', '}')] {
-        if let (Some(start), Some(end)) = (text.find(open), text.rfind(close)) {
-            if start < end {
-                if let Ok(value) = serde_json::from_str::<Value>(&text[start..=end]) {
-                    return Ok(value);
-                }
-            }
-        }
-    }
-    Err(anyhow!("model did not return valid JSON"))
+    Ok(rows)
 }
 
-fn parse_model_response(body: &str) -> Result<ChatResult> {
-    let value = serde_json::from_str::<Value>(body)?;
-    let (content, reasoning) = extract_chat_completion_response(&value)
-        .or_else(|| extract_responses_api_response(&value))
-        .ok_or_else(|| anyhow!("unsupported response shape"))?;
-    Ok(ChatResult {
-        content,
-        reasoning,
-        usage: extract_usage_stats(&value),
+fn summarize_resume_rows(rows: &HashMap<String, OutputRow>) -> Result<(usize, usize)> {
+    let mut generated = 0usize;
+    let mut done = 0usize;
+    for row in rows.values() {
+        match parse_row_status(row)? {
+            RunStatus::Generated => generated += 1,
+            RunStatus::Done => done += 1,
+        }
+    }
+    Ok((generated, done))
+}
+
+fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
+    let user = row.user.trim();
+    ensure!(
+        !user.is_empty(),
+        "generated resume row is missing user for task {}",
+        row.task_id
+    );
+    Ok(PendingTask {
+        task_id: row.task_id.clone(),
+        sample_id: row.sample_id.clone(),
+        subject: row.subject.clone(),
+        prompt: row.prompt.clone(),
+        ref_answer: row.ref_answer.clone(),
+        generator_model: row.generator_model.clone(),
+        user: user.to_owned(),
     })
 }
 
-fn extract_chat_completion_response(value: &Value) -> Option<(String, Option<String>)> {
-    let choice = value.get("choices")?.as_array()?.first()?;
-    let message = choice.get("message");
-    let content = message
-        .and_then(|message| message.get("content"))
-        .and_then(extract_response_text)
-        .or_else(|| choice.get("text").and_then(extract_response_text))
-        .unwrap_or_default();
-    let reasoning = message.and_then(|message| {
-        ["reasoning_content", "reasoning"]
-            .into_iter()
-            .filter_map(|key| message.get(key).and_then(extract_response_text))
-            .next()
-    });
-    Some((content, reasoning))
-}
-
-fn extract_responses_api_response(value: &Value) -> Option<(String, Option<String>)> {
-    let content = value
-        .get("output_text")
-        .and_then(extract_response_text)
-        .or_else(|| {
-            value
-                .get("output")
-                .and_then(Value::as_array)
-                .and_then(|items| {
-                    join_nonempty_text(items.iter().filter_map(|item| {
-                        let item_type = item.get("type").and_then(Value::as_str);
-                        if matches!(item_type, Some("reasoning")) {
-                            None
-                        } else {
-                            item.get("content").and_then(extract_response_text)
-                        }
-                    }))
-                })
-        })
-        .unwrap_or_default();
-    let reasoning = value
-        .get("output")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            join_nonempty_text(items.iter().filter_map(|item| {
-                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                    item.get("summary")
-                        .and_then(extract_response_text)
-                        .or_else(|| item.get("content").and_then(extract_response_text))
-                } else {
-                    None
-                }
-            }))
-        });
-    (!content.is_empty() || reasoning.is_some()).then_some((content, reasoning))
-}
-
-fn extract_response_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => normalize_text(text),
-        Value::Array(items) => join_nonempty_text(items.iter().filter_map(extract_response_text)),
-        Value::Object(map) => ["text", "content", "value", "summary"]
-            .into_iter()
-            .filter_map(|key| map.get(key).and_then(extract_response_text))
-            .next(),
-        Value::Bool(_) | Value::Number(_) => normalize_text(&value.to_string()),
+fn parse_row_status(row: &OutputRow) -> Result<RunStatus> {
+    let status = row.status.trim();
+    match status {
+        "generated" => Ok(RunStatus::Generated),
+        "done" => Ok(RunStatus::Done),
+        _ => Err(anyhow!(
+            "unsupported output status {:?} for task {}",
+            row.status,
+            row.task_id
+        )),
     }
 }
 
-fn join_nonempty_text(parts: impl Iterator<Item = String>) -> Option<String> {
-    let parts = parts
-        .map(|part| part.trim().to_owned())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+fn required_top_level_text(value: &Value, key: &str) -> Result<String> {
+    top_level_text(value, key).ok_or_else(|| anyhow!("missing {key}"))
 }
 
-fn normalize_text(text: &str) -> Option<String> {
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+fn top_level_text(value: &Value, key: &str) -> Option<String> {
+    scalar_text(value.get(key)?)
 }
 
-fn response_preview_error(body: &str) -> String {
-    format!("response preview: {}", preview_text(body, 400))
+fn scalar_text(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null | Value::Array(_) | Value::Object(_) => return None,
+    };
+    (!text.is_empty()).then_some(text)
 }
 
 fn preview_text(text: &str, limit: usize) -> String {
@@ -989,211 +936,6 @@ fn preview_text(text: &str, limit: usize) -> String {
     }
 }
 
-fn extract_usage_stats(value: &Value) -> UsageStats {
-    let usage = value.get("usage");
-    UsageStats {
-        prompt_tokens: usage
-            .and_then(|usage| usage.get("prompt_tokens"))
-            .and_then(Value::as_u64),
-        completion_tokens: usage
-            .and_then(|usage| usage.get("completion_tokens"))
-            .and_then(Value::as_u64),
-        total_tokens: usage
-            .and_then(|usage| usage.get("total_tokens"))
-            .and_then(Value::as_u64),
-        reasoning_tokens: usage
-            .and_then(|usage| usage.get("completion_tokens_details"))
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_u64),
-    }
-}
-
-fn generator_response_format(question_count: usize) -> Value {
-    json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "generated_questions",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "minItems": question_count,
-                        "maxItems": question_count,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "user": { "type": "string" }
-                            },
-                            "required": ["user"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["questions"],
-                "additionalProperties": false
-            }
-        }
-    })
-}
-
-fn extract_text(value: &Value, path: &str) -> Option<String> {
-    extract_value(value, path).and_then(|value| value_to_text(&value))
-}
-
-fn extract_value(value: &Value, path: &str) -> Option<Value> {
-    let mut current = value.clone();
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            continue;
-        }
-        current = match current {
-            Value::Object(map) => map.get(segment).cloned()?,
-            Value::Array(items) => items.get(segment.parse::<usize>().ok()?).cloned()?,
-            Value::String(text) => parse_context_map(&text)?.get(segment).cloned()?,
-            _ => return None,
-        };
-    }
-    Some(current)
-}
-
-fn load_input_rows(path: &Path) -> Result<Vec<Value>> {
-    let text = fs::read_to_string(path)?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if trimmed.starts_with('[') {
-        let value = serde_json::from_str::<Value>(trimmed)
-            .with_context(|| format!("invalid JSON array input: {}", path.display()))?;
-        return match value {
-            Value::Array(items) => Ok(items),
-            _ => bail!("expected JSON array in {}", path.display()),
-        };
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        return match value {
-            Value::Array(items) => Ok(items),
-            Value::Object(_) => Ok(vec![value]),
-            _ => bail!("top-level JSON input must be object or array"),
-        };
-    }
-
-    let mut out = Vec::new();
-    for (line_no, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        out.push(serde_json::from_str::<Value>(line).with_context(|| {
-            format!("invalid JSONL line {} in {}", line_no + 1, path.display())
-        })?);
-    }
-    Ok(out)
-}
-
-fn parse_context_map(text: &str) -> Option<Map<String, Value>> {
-    let mut out = Map::new();
-    let mut current_key = None::<String>;
-    let mut current_lines = Vec::new();
-    let mut saw_section = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(section) = parse_context_header(trimmed) {
-            if let Some(prev) = current_key.replace(section) {
-                out.insert(
-                    prev,
-                    Value::String(current_lines.join("\n").trim().to_owned()),
-                );
-                current_lines.clear();
-            }
-            saw_section = true;
-        } else if current_key.is_some() {
-            current_lines.push(line);
-        }
-    }
-
-    if let Some(prev) = current_key {
-        out.insert(
-            prev,
-            Value::String(current_lines.join("\n").trim().to_owned()),
-        );
-    }
-
-    saw_section.then_some(out)
-}
-
-fn parse_context_header(line: &str) -> Option<String> {
-    line.strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .filter(|section| !section.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn joined_text(value: &Value, paths: &[String], joiner: &str) -> Option<String> {
-    let parts = paths
-        .iter()
-        .filter_map(|path| extract_text(value, path))
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join(joiner))
-}
-
-fn value_to_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => {
-            let text = text.trim();
-            (!text.is_empty()).then(|| text.to_owned())
-        }
-        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value)
-            .ok()
-            .filter(|text| !text.trim().is_empty()),
-    }
-}
-
-fn sample_is_complete(
-    sample: &SourceSample,
-    question_count: usize,
-    existing_ids: &HashSet<String>,
-) -> bool {
-    (0..question_count).all(|i| existing_ids.contains(&record_id(&sample.sample_id, i)))
-}
-
-fn record_id(sample_id: &str, index: usize) -> String {
-    format!("{sample_id}_q{index:03}")
-}
-
-fn pick_answer_model_index(row: &PendingRow, model_count: usize) -> usize {
-    let mut hasher = FxHasher::default();
-    row.record_id.hash(&mut hasher);
-    row.prompt.hash(&mut hasher);
-    row.user.hash(&mut hasher);
-    (hasher.finish() as usize) % model_count
-}
-
-fn merge_assistant(reasoning: Option<String>, content: String) -> String {
-    match (reasoning, content.trim()) {
-        (Some(reasoning), "") => format!("<think>\n{}\n</think>", reasoning.trim()),
-        (Some(reasoning), content) => {
-            format!("<think>\n{}\n</think>\n\n{}", reasoning.trim(), content)
-        }
-        (None, content) => content.to_owned(),
-    }
-}
-
-fn concurrency_limit(requested: usize, job_count: usize) -> usize {
-    match (requested, job_count) {
-        (_, 0) => 1,
-        (0, n) => n,
-        (n, total) => n.min(total),
-    }
-}
-
 fn progress_bar(total: usize, label: &str) -> ProgressBar {
     if total == 0 {
         return ProgressBar::hidden();
@@ -1201,185 +943,31 @@ fn progress_bar(total: usize, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
-            "{msg:>10} [{bar:40.cyan/blue}] {pos}/{len} {percent:>3}% {elapsed_precise}<{eta_precise}",
+            "{prefix:>10} [{bar:40.cyan/blue}] {pos}/{len} {percent:>3}% {elapsed_precise}<{eta_precise}",
         )
-        .expect("valid progress bar template")
-        .progress_chars("##-"),
+        .expect("valid progress bar template"),
     );
-    pb.set_message(label.to_owned());
+    pb.set_prefix(label.to_owned());
     pb
 }
 
-impl UsageStats {
-    fn is_empty(&self) -> bool {
-        self.prompt_tokens.is_none()
-            && self.completion_tokens.is_none()
-            && self.total_tokens.is_none()
-            && self.reasoning_tokens.is_none()
-    }
-
-    fn add_assign(&mut self, other: &Self) {
-        self.prompt_tokens = sum_optional_u64(self.prompt_tokens, other.prompt_tokens);
-        self.completion_tokens = sum_optional_u64(self.completion_tokens, other.completion_tokens);
-        self.total_tokens = sum_optional_u64(self.total_tokens, other.total_tokens);
-        self.reasoning_tokens = sum_optional_u64(self.reasoning_tokens, other.reasoning_tokens);
-    }
-
-    fn summary(&self) -> String {
-        format!(
-            "prompt={} completion={} total={} reasoning={}",
-            optional_u64_text(self.prompt_tokens),
-            optional_u64_text(self.completion_tokens),
-            optional_u64_text(self.total_tokens),
-            optional_u64_text(self.reasoning_tokens),
-        )
-    }
-}
-
-impl ChatError {
-    fn http_message(message: String) -> Self {
-        Self {
-            kind: ChatErrorKind::Http,
-            message,
-        }
-    }
-
-    fn api(status: StatusCode, body: String) -> Self {
-        Self {
-            kind: ChatErrorKind::Api {
-                status,
-                body: body.clone(),
-            },
-            message: format!("chat completion failed with status {status}: {body}"),
-        }
-    }
-
-    fn parse(err: anyhow::Error) -> Self {
-        Self {
-            kind: ChatErrorKind::Parse,
-            message: err.to_string(),
-        }
-    }
-
-    fn is_response_format_unsupported(&self) -> bool {
-        match &self.kind {
-            ChatErrorKind::Api { status, body } if *status == StatusCode::BAD_REQUEST => {
-                let body = body.to_ascii_lowercase();
-                body.contains("response_format")
-                    || body.contains("json_schema")
-                    || body.contains("text.format")
-                    || body.contains("format.name")
-            }
-            _ => false,
-        }
-    }
-}
-
-impl std::fmt::Display for ChatError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ChatError {}
-
-fn sum_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn split_curl_response(stdout: &str) -> std::result::Result<(StatusCode, String), ChatError> {
-    let Some(index) = stdout.rfind(CURL_HTTP_STATUS_MARKER) else {
-        return Err(ChatError::http_message(format!(
-            "curl response missing status marker; response preview: {}",
-            preview_text(stdout, 400),
-        )));
-    };
-    let body = stdout[..index].to_owned();
-    let status_text = stdout[index + CURL_HTTP_STATUS_MARKER.len()..].trim();
-    let status = StatusCode::from_bytes(status_text.as_bytes()).map_err(|err| {
-        ChatError::http_message(format!("invalid curl status code {status_text:?}: {err}"))
-    })?;
-    Ok((status, body))
-}
-
-fn optional_u64_text(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned())
-}
-
-fn resolve_api_key(model: &Model) -> Result<String> {
-    if let Some(api_key) = model
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(api_key.to_owned());
-    }
-
-    if let Some(env_name) = model
-        .api_key_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return std::env::var(env_name).with_context(|| {
-            format!(
-                "missing environment variable {env_name} for model {}",
-                model.name
-            )
-        });
-    }
-
-    if let Ok(value) = std::env::var("RWKV_GEPA_API_KEY") {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
-
-    if let Ok(value) = std::env::var("OPENAI_API_KEY") {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
-
-    bail!(
-        "missing api key for model {}: set api_key, api_key_env, RWKV_GEPA_API_KEY, or OPENAI_API_KEY",
-        model.name
-    )
+fn concurrency_limit(configured: usize, total: usize) -> usize {
+    configured.max(1).min(total.max(1))
 }
 
 fn default_subject() -> String {
     "general".to_owned()
 }
 
-fn default_sample_id_prefix() -> String {
-    "sample".to_owned()
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            jsonl_path: PathBuf::from("data/rwkv_train.jsonl"),
+        }
+    }
 }
 
-fn default_sample_id_joiner() -> String {
-    "#".to_owned()
-}
-
-fn default_subject_joiner() -> String {
-    "/".to_owned()
-}
-
-fn default_prompt_joiner() -> String {
-    "\n\n".to_owned()
-}
-
-#[rustfmt::skip]
-impl Default for Output { fn default() -> Self { Self { jsonl: "data/rwkv_train.jsonl".into() } } }
-
-#[rustfmt::skip]
-impl Default for Run {
+impl Default for RunConfig {
     fn default() -> Self {
         Self {
             resume: true,
@@ -1390,358 +978,20 @@ impl Default for Run {
     }
 }
 
-#[rustfmt::skip]
-impl Default for Concurrency {
+impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
-            generator_requests: 8,
-            answer_requests: 32,
+            generate_requests: 4,
+            answer_requests: 16,
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        ChatError, ChatMessage, ChatRequest, Input, UsageStats, concurrency_limit, extract_text,
-        generated_user_text, generator_response_format, load_config, load_input_rows, load_samples,
-        merge_assistant, normalize_sample, parse_model_response, record_id, split_curl_response,
-    };
-    use reqwest::StatusCode;
-    use serde_json::json;
-    use std::{fs, path::PathBuf};
-
-    #[test]
-    fn zero_requested_uses_all_jobs() {
-        assert_eq!(concurrency_limit(0, 100), 100);
-        assert_eq!(concurrency_limit(0, 2), 2);
-    }
-
-    #[test]
-    fn concurrency_is_capped_by_job_count() {
-        assert_eq!(concurrency_limit(4, 100), 4);
-        assert_eq!(concurrency_limit(32, 10), 10);
-        assert_eq!(concurrency_limit(8, 0), 1);
-    }
-
-    #[test]
-    fn dotted_json_paths_work() {
-        let value = json!({
-            "meta": { "id": "abc" },
-            "messages": [{ "content": "first" }, { "content": "second" }],
-        });
-        assert_eq!(extract_text(&value, "meta.id").as_deref(), Some("abc"));
-        assert_eq!(
-            extract_text(&value, "messages.1.content").as_deref(),
-            Some("second")
-        );
-    }
-
-    #[test]
-    fn context_paths_work() {
-        let value = json!({
-            "context": "[lp]\nen-ar_EG\n\n[domain]\nnews\n\n[document_id]\ndoc-1\n\n[segment_id]\n7\n\n[translation_prompt]\nTranslate this.\n\n[reference_target]\nfoo"
-        });
-        assert_eq!(
-            extract_text(&value, "context.lp").as_deref(),
-            Some("en-ar_EG")
-        );
-        assert_eq!(
-            extract_text(&value, "context.domain").as_deref(),
-            Some("news")
-        );
-        assert_eq!(
-            extract_text(&value, "context.document_id").as_deref(),
-            Some("doc-1")
-        );
-        assert_eq!(
-            extract_text(&value, "context.segment_id").as_deref(),
-            Some("7")
-        );
-    }
-
-    #[test]
-    fn normalize_sample_builds_prompt_from_multiple_paths() {
-        let input = Input {
-            local_jsonl_path: "unused.jsonl".into(),
-            limit: None,
-            start_index: 0,
-            default_subject: "general".into(),
-            sample_id_prefix: "sample".into(),
-            sample_id_paths: Vec::new(),
-            sample_id_joiner: "#".into(),
-            sample_id_path: Some("id".into()),
-            subject_paths: Vec::new(),
-            subject_joiner: "/".into(),
-            subject_path: Some("task.subject".into()),
-            prompt_paths: vec!["task.prompt".into(), "task.question".into()],
-            ref_answer_path: "answer".into(),
-            prompt_joiner: "\n\n".into(),
-        };
-        let sample = normalize_sample(
-            &input,
-            3,
-            json!({
-                "id": "row-7",
-                "task": {
-                    "subject": "coding",
-                    "prompt": "Write a function.",
-                    "question": "Use Rust."
-                },
-                "answer": "fn main() {}"
-            }),
-        )
-        .unwrap();
-        assert_eq!(sample.sample_id, "row-7");
-        assert_eq!(sample.subject, "coding");
-        assert_eq!(sample.prompt, "Write a function.\n\nUse Rust.");
-        assert_eq!(sample.ref_answer, "fn main() {}");
-    }
-
-    #[test]
-    fn normalize_sample_supports_joined_context_fields() {
-        let input = Input {
-            local_jsonl_path: "unused.jsonl".into(),
-            limit: None,
-            start_index: 0,
-            default_subject: "general".into(),
-            sample_id_prefix: "sample".into(),
-            sample_id_paths: vec!["context.document_id".into(), "context.segment_id".into()],
-            sample_id_joiner: "#".into(),
-            sample_id_path: None,
-            subject_paths: vec!["context.lp".into(), "context.domain".into()],
-            subject_joiner: "/".into(),
-            subject_path: None,
-            prompt_paths: vec!["context.translation_prompt".into()],
-            ref_answer_path: "context.reference_target".into(),
-            prompt_joiner: "\n\n".into(),
-        };
-        let sample = normalize_sample(
-            &input,
-            0,
-            json!({
-                "context": "[lp]\nen-ar_EG\n\n[domain]\nnews\n\n[document_id]\ndoc-1\n\n[segment_id]\n7\n\n[translation_prompt]\nTranslate.\n\n[reference_target]\nfoo"
-            }),
-        )
-        .unwrap();
-        assert_eq!(sample.sample_id, "doc-1#7");
-        assert_eq!(sample.subject, "en-ar_EG/news");
-        assert_eq!(sample.prompt, "Translate.");
-        assert_eq!(sample.ref_answer, "foo");
-    }
-
-    #[test]
-    fn generated_user_accepts_object_shape() {
-        let user = generated_user_text(json!({ "question": "Solve this" })).unwrap();
-        assert_eq!(user, "Solve this");
-    }
-
-    #[test]
-    fn assistant_merges_reasoning() {
-        let assistant = merge_assistant(Some("step by step".into()), "final answer".into());
-        assert_eq!(assistant, "<think>\nstep by step\n</think>\n\nfinal answer");
-    }
-
-    #[test]
-    fn record_ids_are_stable() {
-        assert_eq!(record_id("sample_000001", 5), "sample_000001_q005");
-    }
-
-    #[test]
-    fn load_input_rows_supports_json_array() {
-        let path = std::env::temp_dir().join("rwkv_gepa_v1_test_array.json");
-        fs::write(&path, "[{\"a\":1},{\"a\":2}]").unwrap();
-        let rows = load_input_rows(&path).unwrap();
-        assert_eq!(rows.len(), 2);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn config_targets_one_hundred_rows_from_ten_samples() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml");
-        let cfg = load_config(&path).unwrap();
-        let samples = load_samples(&cfg).unwrap();
-        assert_eq!(cfg.generator.model.name, "gpt-5.4");
-        assert_eq!(cfg.generator.question_count, 10);
-        assert_eq!(cfg.input.limit, Some(10));
-        assert_eq!(cfg.concurrency.generator_requests, 8);
-        assert_eq!(cfg.concurrency.answer_requests, 32);
-        assert!(cfg.run.disable_env_proxy);
-        assert_eq!(samples.len(), 10);
-        assert_eq!(samples.len() * cfg.generator.question_count, 100);
-    }
-
-    #[test]
-    fn parses_standard_chat_completion_response() {
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "hello"
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 11,
-                "completion_tokens": 21,
-                "total_tokens": 32,
-                "completion_tokens_details": {
-                    "reasoning_tokens": 14
-                }
-            }
-        })
-        .to_string();
-        assert_eq!(
-            parse_model_response(&body).unwrap(),
-            super::ChatResult {
-                content: "hello".to_owned(),
-                reasoning: None,
-                usage: UsageStats {
-                    prompt_tokens: Some(11),
-                    completion_tokens: Some(21),
-                    total_tokens: Some(32),
-                    reasoning_tokens: Some(14),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn parses_chat_completion_content_parts() {
-        let body = json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        { "type": "text", "text": "first" },
-                        { "type": "output_text", "text": "second" }
-                    ],
-                    "reasoning_content": [
-                        { "type": "text", "text": "chain" }
-                    ]
-                }
-            }]
-        })
-        .to_string();
-        assert_eq!(
-            parse_model_response(&body).unwrap(),
-            super::ChatResult {
-                content: "first\n\nsecond".to_owned(),
-                reasoning: Some("chain".to_owned()),
-                usage: UsageStats::default(),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_responses_api_shape() {
-        let body = json!({
-            "output": [
-                {
-                    "type": "reasoning",
-                    "summary": [{ "type": "summary_text", "text": "thought" }]
-                },
-                {
-                    "type": "message",
-                    "content": [{ "type": "output_text", "text": "answer" }]
-                }
-            ]
-        })
-        .to_string();
-        assert_eq!(
-            parse_model_response(&body).unwrap(),
-            super::ChatResult {
-                content: "answer".to_owned(),
-                reasoning: Some("thought".to_owned()),
-                usage: UsageStats::default(),
-            }
-        );
-    }
-
-    #[test]
-    fn chat_request_serializes_max_completion_tokens_when_set() {
-        let value = serde_json::to_value(ChatRequest {
-            model: "gpt-5",
-            messages: [ChatMessage {
-                role: "user",
-                content: "hello",
-            }],
-            enable_thinking: true,
-            response_format: Some(&json!({ "type": "json_schema" })),
-            max_completion_tokens: Some(512),
-            reasoning_effort: Some("medium"),
-        })
-        .unwrap();
-        assert_eq!(value.get("max_completion_tokens"), Some(&json!(512)));
-        assert_eq!(
-            value.get("response_format"),
-            Some(&json!({ "type": "json_schema" }))
-        );
-    }
-
-    #[test]
-    fn usage_stats_addition_keeps_totals() {
-        let mut total = UsageStats {
-            prompt_tokens: Some(10),
-            completion_tokens: None,
-            total_tokens: Some(10),
-            reasoning_tokens: Some(2),
-        };
-        total.add_assign(&UsageStats {
-            prompt_tokens: Some(5),
-            completion_tokens: Some(7),
-            total_tokens: Some(12),
-            reasoning_tokens: None,
-        });
-        assert_eq!(
-            total,
-            UsageStats {
-                prompt_tokens: Some(15),
-                completion_tokens: Some(7),
-                total_tokens: Some(22),
-                reasoning_tokens: Some(2),
-            }
-        );
-    }
-
-    #[test]
-    fn generator_response_format_uses_questions_schema() {
-        let format = generator_response_format(3);
-        assert_eq!(format["type"], json!("json_schema"));
-        assert_eq!(
-            format["json_schema"]["schema"]["properties"]["questions"]["minItems"],
-            json!(3)
-        );
-    }
-
-    #[test]
-    fn response_format_unsupported_is_detected() {
-        let err = ChatError::api(
-            StatusCode::BAD_REQUEST,
-            "Unsupported parameter: response_format.json_schema".into(),
-        );
-        assert!(err.is_response_format_unsupported());
-    }
-
-    #[test]
-    fn vendor_specific_text_format_error_is_detected() {
-        let err = ChatError::api(
-            StatusCode::BAD_REQUEST,
-            "{\"error\":{\"message\":\"Missing required parameter: '***.***.name'.\",\"param\":\"text.format.name\"}}".into(),
-        );
-        assert!(err.is_response_format_unsupported());
-    }
-
-    #[test]
-    fn split_curl_response_extracts_status_and_body() {
-        let (status, body) =
-            split_curl_response("{\"ok\":true}\n__CURL_HTTP_STATUS__:200").unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "{\"ok\":true}");
-    }
-
-    #[test]
-    fn split_curl_response_rejects_missing_marker() {
-        let err = split_curl_response("{\"ok\":true}").unwrap_err();
-        assert!(err.to_string().contains("missing status marker"));
+impl RunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generated => "generated",
+            Self::Done => "done",
+        }
     }
 }

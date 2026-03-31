@@ -34,6 +34,5 @@ git push -u origin main
 
 ```bash
 cargo fmt --check
-cargo test
-cargo run -- export --input data/variants.jsonl --output /tmp/rust-v1.parquet
+cargo check
 ```

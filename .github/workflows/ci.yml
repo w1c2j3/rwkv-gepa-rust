@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,11 +13,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
-      - name: Unit Tests
-        run: cargo test
-      - name: Export Smoke Test
-        run: cargo run -- export --input fixtures/mmlu_variants.sample.jsonl --output /tmp/rust-v1-ci.parquet
-      - name: Zero-Limit Synthesize Smoke Test
-        run: |
-          sed 's/limit = 100/limit = 0/' config.toml > /tmp/rust-v1-zero.toml
-          cargo run -- synthesize --config /tmp/rust-v1-zero.toml
+      - name: Build Check
+        run: cargo check

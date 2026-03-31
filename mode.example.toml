@@ -1,0 +1,56 @@
+[input]
+# Real evaluation-pipeline export: top-level JSON is structured, and context is the raw context string.
+dataset_path = "cmmlu_task122_failed_contexts.jsonl"
+limit = 10
+start_index = 0
+default_subject = "cmmlu/task122"
+
+[generator]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "gpt-5.4"
+api_key = "YOUR_API_KEY"
+variant_count = 10
+max_completion_tokens = 512
+
+[[answer_models]]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "qwen3-235b-a22b-thinking-2507"
+api_key = "YOUR_API_KEY"
+max_completion_tokens = 2048
+
+[[answer_models]]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "qwen3-30b-a3b-thinking-2507"
+api_key = "YOUR_API_KEY"
+max_completion_tokens = 2048
+
+[[answer_models]]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "deepseek-reasoner"
+api_key = "YOUR_API_KEY"
+max_completion_tokens = 2048
+
+[[answer_models]]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "kimi-k2-thinking"
+api_key = "YOUR_API_KEY"
+max_completion_tokens = 2048
+
+[[answer_models]]
+endpoint = "https://api.ablai.top/v1/chat/completions"
+model_name = "qwen3-next-80b-a3b-thinking"
+api_key = "YOUR_API_KEY"
+max_completion_tokens = 2048
+
+[output]
+jsonl_path = "data/rwkv_train.jsonl"
+
+[run]
+resume = true
+request_timeout_seconds = 240
+disable_env_proxy = true
+force_http1 = true
+
+[concurrency]
+generate_requests = 8
+answer_requests = 32

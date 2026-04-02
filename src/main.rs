@@ -9,11 +9,20 @@ use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, stream};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::{Client, StatusCode};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::{Client, Response, StatusCode};
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use serde_jsonlines::{append_json_lines, json_lines};
+
+macro_rules! default_value {
+    ($name:ident, $ty:ty, $value:expr) => {
+        fn $name() -> $ty {
+            $value
+        }
+    };
+}
 
 #[derive(Parser)]
 #[command(author, version, about = "Lean JSONL -> RWKV training pipeline")]
@@ -38,11 +47,11 @@ struct Config {
     input: InputConfig,
     generator: GeneratorConfig,
     answer_models: Vec<ModelConfig>,
-    #[serde(default)]
+    #[serde(default = "OutputConfig::default")]
     output: OutputConfig,
-    #[serde(default)]
+    #[serde(default = "RunConfig::default")]
     run: RunConfig,
-    #[serde(default)]
+    #[serde(default = "ConcurrencyConfig::default")]
     concurrency: ConcurrencyConfig,
 }
 
@@ -54,8 +63,8 @@ struct InputConfig {
     limit: Option<usize>,
     #[serde(default)]
     start_index: usize,
-    #[serde(default = "default_subject")]
-    default_subject: String,
+    #[serde(default = "default_subject", rename = "default_subject")]
+    _default_subject: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -64,6 +73,10 @@ struct GeneratorConfig {
     #[serde(flatten)]
     model: ModelConfig,
     variant_count: usize,
+    #[serde(default = "default_generation_attempts")]
+    generation_attempts: usize,
+    #[serde(default = "default_validate_generated_questions")]
+    validate_generated_questions: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -76,39 +89,48 @@ struct ModelConfig {
     max_completion_tokens: Option<u32>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    thinking: Option<ThinkingSetting>,
+    #[serde(default)]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(default)]
 #[serde(deny_unknown_fields)]
 struct OutputConfig {
+    #[serde(default = "default_output_jsonl_path")]
     jsonl_path: PathBuf,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(default)]
 #[serde(deny_unknown_fields)]
 struct RunConfig {
+    #[serde(default = "default_resume")]
     resume: bool,
+    #[serde(default = "default_request_timeout_seconds")]
     request_timeout_seconds: f64,
+    #[serde(default = "default_disable_env_proxy")]
     disable_env_proxy: bool,
+    #[serde(default = "default_force_http1")]
     force_http1: bool,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(default)]
 #[serde(deny_unknown_fields)]
 struct ConcurrencyConfig {
+    #[serde(default = "default_generate_requests")]
     generate_requests: usize,
+    #[serde(default = "default_answer_requests")]
     answer_requests: usize,
 }
 
 #[derive(Clone)]
 struct SourceSample {
     sample_id: String,
-    subject: String,
-    prompt: String,
-    ref_answer: String,
+    source_mcq: MultipleChoiceQuestion,
+    original_correct_answer: String,
 }
 
 #[derive(Clone)]
@@ -120,28 +142,73 @@ struct GenerateJob {
 #[derive(Clone)]
 struct PendingTask {
     task_id: String,
-    sample_id: String,
-    subject: String,
-    prompt: String,
-    ref_answer: String,
-    generator_model: String,
     user: String,
+    generated_correct_answer: String,
+    change_summary: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OutputRow {
     task_id: String,
-    sample_id: String,
-    subject: String,
-    prompt: String,
-    ref_answer: String,
     status: String,
-    generator_model: String,
+    #[serde(
+        default,
+        alias = "rewritten_user",
+        skip_serializing_if = "String::is_empty"
+    )]
     user: String,
-    assistant: String,
-    text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    generated_correct_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    change_summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     answer_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    assistant: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MultipleChoiceQuestion {
+    preamble: String,
+    question: String,
+    choices: Vec<Choice>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Choice {
+    label: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedQuestionsEnvelope {
+    questions: Vec<GeneratedQuestionItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedQuestionItem {
+    question: String,
+    choices: Vec<Choice>,
+    correct_answer: String,
+    change_summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationEnvelope {
+    items: Vec<ValidationItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationItem {
+    index: usize,
+    valid: bool,
+    reason: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +225,12 @@ struct ChatRequest<'a> {
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
 }
@@ -166,6 +239,19 @@ struct ChatRequest<'a> {
 struct ChatMessage<'a> {
     role: &'a str,
     content: &'a str,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThinkingSetting {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ThinkingRequest<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -341,32 +427,87 @@ async fn generate_tasks(
     generator: GeneratorConfig,
     job: GenerateJob,
 ) -> Result<Vec<PendingTask>> {
-    let prompt = build_generation_prompt(&job.sample, generator.variant_count)?;
-    let result = client
-        .chat(&generator.model, &prompt, true)
-        .await
-        .with_context(|| format!("generator failed for sample {}", job.sample.sample_id))?;
-    let users = parse_generated_users(&result.content, generator.variant_count)?;
-    job.missing_indices
-        .into_iter()
-        .map(|index| {
-            let user = users.get(index).cloned().ok_or_else(|| {
-                anyhow!(
-                    "missing generated variant {index} for {}",
-                    job.sample.sample_id
+    let generate_count = job.missing_indices.len();
+    let mut feedback = None::<String>;
+
+    for attempt in 0..generator.generation_attempts {
+        let prompt = build_generation_prompt(&job.sample, generate_count, feedback.as_deref())?;
+        let result = client
+            .chat(&generator.model, &prompt, true)
+            .await
+            .with_context(|| format!("generator failed for sample {}", job.sample.sample_id))?;
+        let generated = parse_generated_questions(&result.content, generate_count, &job.sample)
+            .with_context(|| {
+                format!(
+                    "invalid generated questions for sample {} on logical attempt {}/{}",
+                    job.sample.sample_id,
+                    attempt + 1,
+                    generator.generation_attempts
                 )
-            })?;
-            Ok(PendingTask {
-                task_id: task_id(&job.sample.sample_id, index),
-                sample_id: job.sample.sample_id.clone(),
-                subject: job.sample.subject.clone(),
-                prompt: job.sample.prompt.clone(),
-                ref_answer: job.sample.ref_answer.clone(),
-                generator_model: generator.model.model_name.clone(),
-                user,
+            });
+
+        let generated = match generated {
+            Ok(generated) => generated,
+            Err(err) if attempt + 1 < generator.generation_attempts => {
+                feedback = Some(err.to_string());
+                eprintln!(
+                    "retrying generation for {} after parse/validation failure on attempt {}/{}: {}",
+                    job.sample.sample_id,
+                    attempt + 1,
+                    generator.generation_attempts,
+                    err
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        if generator.validate_generated_questions {
+            if let Err(err) = validate_generated_questions_with_model(
+                &client,
+                &generator.model,
+                &job.sample,
+                &generated,
+            )
+            .await
+            {
+                if attempt + 1 < generator.generation_attempts {
+                    feedback = Some(err.to_string());
+                    eprintln!(
+                        "retrying generation for {} after model validation failure on attempt {}/{}: {}",
+                        job.sample.sample_id,
+                        attempt + 1,
+                        generator.generation_attempts,
+                        err
+                    );
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+
+        let tasks = job
+            .missing_indices
+            .iter()
+            .zip(generated.into_iter())
+            .map(|(index, generated)| PendingTask {
+                task_id: task_id(&job.sample.sample_id, *index),
+                user: render_generated_user(
+                    &job.sample.source_mcq.preamble,
+                    &generated.question,
+                    &generated.choices,
+                ),
+                generated_correct_answer: generated.correct_answer,
+                change_summary: generated.change_summary,
             })
-        })
-        .collect()
+            .collect();
+        return Ok(tasks);
+    }
+
+    Err(anyhow!(
+        "generator logic unexpectedly exhausted without returning for sample {}",
+        job.sample.sample_id
+    ))
 }
 
 async fn answer_task(
@@ -382,16 +523,13 @@ async fn answer_task(
     let text = rwkv_text(&task.user, &assistant);
     Ok(OutputRow {
         task_id: task.task_id,
-        sample_id: task.sample_id,
-        subject: task.subject,
-        prompt: task.prompt,
-        ref_answer: task.ref_answer,
         status: RunStatus::Done.as_str().to_owned(),
-        generator_model: task.generator_model,
         user: task.user,
+        generated_correct_answer: task.generated_correct_answer,
+        change_summary: task.change_summary,
+        answer_model: model.model_name,
         assistant,
         text,
-        answer_model: model.model_name,
     })
 }
 
@@ -444,8 +582,22 @@ impl OpenAiClient {
         prompt: &str,
         json_output: bool,
     ) -> std::result::Result<ChatResult, RequestError> {
-        let body = self.send_chat_request(model, prompt, json_output).await?;
-        parse_chat_result(&body).map_err(RequestError::parse)
+        let response = self.send_chat_request(model, prompt, json_output).await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.map_err(RequestError::http)?;
+        if !status.is_success() {
+            return Err(RequestError::api(status, body));
+        }
+        if model.stream || content_type_is_event_stream(content_type.as_deref()) {
+            parse_stream_chat_result(&body).map_err(RequestError::parse)
+        } else {
+            parse_chat_result(&body).map_err(RequestError::parse)
+        }
     }
 
     async fn send_chat_request(
@@ -453,21 +605,14 @@ impl OpenAiClient {
         model: &ModelConfig,
         prompt: &str,
         json_output: bool,
-    ) -> std::result::Result<String, RequestError> {
-        let response = self
-            .http
+    ) -> std::result::Result<Response, RequestError> {
+        self.http
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(&chat_request(model, prompt, json_output))
             .send()
             .await
-            .map_err(RequestError::http)?;
-        let status = response.status();
-        let body = response.text().await.map_err(RequestError::http)?;
-        if !status.is_success() {
-            return Err(RequestError::api(status, body));
-        }
-        Ok(body)
+            .map_err(RequestError::http)
     }
 }
 
@@ -515,6 +660,11 @@ fn chat_request<'a>(model: &'a ModelConfig, prompt: &'a str, json_output: bool) 
         }],
         max_completion_tokens: model.max_completion_tokens,
         reasoning_effort: model.reasoning_effort.as_deref(),
+        stream: model.stream && !json_output,
+        thinking: model.thinking.as_ref().map(|thinking| ThinkingRequest {
+            kind: thinking.kind.as_str(),
+        }),
+        enable_thinking: model.enable_thinking,
         response_format: json_output.then(json_object_response_format),
     }
 }
@@ -525,12 +675,36 @@ fn json_object_response_format() -> ResponseFormat {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn content_type_is_event_stream(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     let mut cfg: Config = toml::from_str(&fs::read_to_string(path)?)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     cfg.input.dataset_path = resolve(base, &cfg.input.dataset_path);
     cfg.output.jsonl_path = resolve(base, &cfg.output.jsonl_path);
+    trim_model_config(&mut cfg.generator.model);
+    cfg.answer_models.iter_mut().for_each(trim_model_config);
     Ok(cfg)
+}
+
+fn trim_model_config(model: &mut ModelConfig) {
+    model.endpoint = model.endpoint.trim().to_owned();
+    model.model_name = model.model_name.trim().to_owned();
+    model.api_key = model.api_key.trim().to_owned();
+    if let Some(reasoning_effort) = &mut model.reasoning_effort {
+        *reasoning_effort = reasoning_effort.trim().to_owned();
+    }
+    if let Some(thinking) = &mut model.thinking {
+        thinking.kind = thinking.kind.trim().to_owned();
+    }
 }
 
 fn validate_config(cfg: &Config) -> Result<()> {
@@ -539,13 +713,15 @@ fn validate_config(cfg: &Config) -> Result<()> {
         "generator.variant_count must be > 0"
     );
     ensure!(
+        cfg.generator.generation_attempts > 0,
+        "generator.generation_attempts must be > 0"
+    );
+    ensure!(
         !cfg.answer_models.is_empty(),
         "need at least one answer model"
     );
     validate_model(&cfg.generator.model)?;
-    for model in &cfg.answer_models {
-        validate_model(model)?;
-    }
+    cfg.answer_models.iter().try_for_each(validate_model)?;
     Ok(())
 }
 
@@ -562,6 +738,12 @@ fn validate_model(model: &ModelConfig) -> Result<()> {
         !model.api_key.trim().is_empty(),
         "api_key must not be empty"
     );
+    if let Some(thinking) = &model.thinking {
+        ensure!(
+            !thinking.kind.trim().is_empty(),
+            "thinking.type must not be empty"
+        );
+    }
     Ok(())
 }
 
@@ -598,18 +780,223 @@ fn load_samples(cfg: &Config) -> Result<Vec<SourceSample>> {
     Ok(out)
 }
 
-fn normalize_sample(input: &InputConfig, _index: usize, value: Value) -> Result<SourceSample> {
+fn normalize_sample(_input: &InputConfig, _index: usize, value: Value) -> Result<SourceSample> {
     let task_id = required_top_level_text(&value, "task_id")?;
     let sample_index = required_top_level_text(&value, "sample_index")?;
     let completions_id = required_top_level_text(&value, "completions_id")?;
-    let prompt = required_top_level_text(&value, "context")?;
-    let ref_answer = required_top_level_text(&value, "ref_answer")?;
+    let context = required_top_level_text(&value, "context")?;
+    let original_correct_answer =
+        normalize_answer_label(&required_top_level_text(&value, "ref_answer")?)
+            .ok_or_else(|| anyhow!("ref_answer must start with an option label"))?;
+    let source_user = parse_single_turn_context(&context).with_context(|| {
+        format!(
+            "invalid single-turn context for sample {}",
+            format!("{task_id}_{sample_index}_{completions_id}")
+        )
+    })?;
+    let source_mcq = parse_multiple_choice_question(&source_user).with_context(|| {
+        format!(
+            "source user is not a supported multiple-choice prompt for sample {}",
+            format!("{task_id}_{sample_index}_{completions_id}")
+        )
+    })?;
+    ensure!(
+        choice_text(&source_mcq.choices, &original_correct_answer).is_some(),
+        "ref_answer {} does not match any parsed choice",
+        original_correct_answer
+    );
     Ok(SourceSample {
         sample_id: format!("{task_id}_{sample_index}_{completions_id}"),
-        subject: input.default_subject.clone(),
-        prompt,
-        ref_answer,
+        source_mcq,
+        original_correct_answer,
     })
+}
+
+fn parse_single_turn_context(context: &str) -> Result<String> {
+    let normalized = normalize_context_text(context);
+    let trimmed = normalized.trim();
+    ensure!(!trimmed.is_empty(), "context is empty");
+
+    let user_headers = header_positions(trimmed, "User:");
+    let assistant_headers = header_positions(trimmed, "Assistant:");
+    ensure!(
+        user_headers.len() == 1,
+        "context must contain exactly one line-start User: header, got {} in {:?}",
+        user_headers.len(),
+        preview_text(trimmed, 120)
+    );
+    ensure!(
+        assistant_headers.len() == 1,
+        "context must contain exactly one line-start Assistant: header, got {} in {:?}",
+        assistant_headers.len(),
+        preview_text(trimmed, 120)
+    );
+
+    let user_start = user_headers[0];
+    let assistant_start = assistant_headers[0];
+    ensure!(user_start == 0, "context must start with User:");
+    ensure!(
+        assistant_start > user_start,
+        "Assistant: header must appear after User: header"
+    );
+
+    let user = trimmed["User:".len()..assistant_start].trim();
+    ensure!(!user.is_empty(), "context user content is empty");
+    Ok(user.to_owned())
+}
+
+fn parse_multiple_choice_question(text: &str) -> Result<MultipleChoiceQuestion> {
+    let normalized = text.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    let question_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Question:"))
+        .ok_or_else(|| anyhow!("missing Question: line"))?;
+    let choices_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Choices:"))
+        .ok_or_else(|| anyhow!("missing Choices: line"))?;
+    ensure!(
+        choices_idx > question_idx,
+        "Choices: must appear after Question:"
+    );
+
+    let preamble = lines[..question_idx].join("\n").trim().to_owned();
+
+    let mut question_lines = Vec::new();
+    let question_head = lines[question_idx].trim_start();
+    question_lines.push(
+        question_head
+            .strip_prefix("Question:")
+            .unwrap_or(question_head)
+            .trim(),
+    );
+    question_lines.extend(
+        lines[question_idx + 1..choices_idx]
+            .iter()
+            .map(|line| line.trim_end()),
+    );
+    let question = question_lines.join("\n").trim().to_owned();
+    ensure!(!question.is_empty(), "question stem is empty");
+
+    let mut choices = Vec::<Choice>::new();
+    for line in &lines[choices_idx + 1..] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((label, text)) = parse_choice_line(trimmed) {
+            choices.push(Choice { label, text });
+            continue;
+        }
+        if let Some(last) = choices.last_mut() {
+            last.text.push(' ');
+            last.text.push_str(trimmed);
+            continue;
+        }
+        return Err(anyhow!(
+            "invalid choice line before any parsed choice: {:?}",
+            trimmed
+        ));
+    }
+
+    ensure!(choices.len() >= 2, "need at least two parsed choices");
+    let expected_labels = expected_labels(choices.len());
+    let actual_labels = choices
+        .iter()
+        .map(|choice| choice.label.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        actual_labels == expected_labels,
+        "choices must use sequential labels {:?}, got {:?}",
+        expected_labels,
+        actual_labels
+    );
+
+    Ok(MultipleChoiceQuestion {
+        preamble,
+        question,
+        choices,
+    })
+}
+
+fn parse_choice_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let mut chars = trimmed.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let label = first.to_ascii_uppercase().to_string();
+    let (delimiter_idx, delimiter) = chars.next()?;
+    if !matches!(delimiter, '.' | '．' | '、' | ':' | '：' | ')' | '）') {
+        return None;
+    }
+    let text = trimmed[delimiter_idx + delimiter.len_utf8()..].trim();
+    (!text.is_empty()).then_some((label, text.to_owned()))
+}
+
+fn normalize_answer_label(text: &str) -> Option<String> {
+    text.trim()
+        .chars()
+        .find(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_uppercase().to_string())
+}
+
+fn expected_labels(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| ((b'A' + index as u8) as char).to_string())
+        .collect()
+}
+
+fn choice_text<'a>(choices: &'a [Choice], label: &str) -> Option<&'a str> {
+    choices
+        .iter()
+        .find(|choice| choice.label == label)
+        .map(|choice| choice.text.as_str())
+}
+
+fn normalize_context_text(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_owned();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn header_positions(text: &str, header: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim_end_matches(&['\r', '\n'][..]);
+        if line.starts_with(header) {
+            positions.push(offset);
+        }
+        offset += segment.len();
+    }
+    positions
 }
 
 fn build_resume_plan(
@@ -645,53 +1032,343 @@ fn build_resume_plan(
     Ok((generator_jobs, pending_tasks))
 }
 
-fn build_generation_prompt(sample: &SourceSample, variant_count: usize) -> Result<String> {
+fn build_generation_prompt(
+    sample: &SourceSample,
+    variant_count: usize,
+    feedback: Option<&str>,
+) -> Result<String> {
+    let original_correct_text =
+        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
+            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
+    let choice_count = sample.source_mcq.choices.len();
+    let original_labels = expected_labels(sample.source_mcq.choices.len()).join(", ");
+    let original_user = render_generated_user(
+        &sample.source_mcq.preamble,
+        &sample.source_mcq.question,
+        &sample.source_mcq.choices,
+    );
+
+    let feedback_block = feedback
+        .map(|text| {
+            format!(
+                "\nPrevious attempt failed. Fix these issues instead of repeating them:\n{}\n",
+                text
+            )
+        })
+        .unwrap_or_default();
+
     Ok(format!(
-        "You are rewriting user questions for RWKV training.\n\
+        "You are creating closely related but answer-changing multiple-choice questions for RWKV training.\n\
 Return only JSON.\n\
 The response must be a single JSON object with exactly one key named \"questions\".\n\
 The value of \"questions\" must be an array of exactly {variant_count} objects.\n\
-Each object must have exactly one key named \"user\".\n\
-Each \"user\" value must be a standalone rewritten user question.\n\
-Do not answer the question.\n\
-Do not include markdown, code fences, commentary, or extra keys.\n\n\
-Source task:\n{}",
+Each object must contain exactly these keys:\n\
+- \"question\": the new question stem only, without any \"Question:\" prefix\n\
+- \"choices\": an array of exactly {choice_count} objects, each with exactly two keys: \"label\" and \"text\"\n\
+- \"correct_answer\": the single correct option label\n\
+- \"change_summary\": a short Chinese sentence explaining what semantic pivot changed and why the answer changed\n\n\
+Hard requirements for every generated item:\n\
+- It must stay in the same subject/domain as the original question.\n\
+- It must be a new question, not a paraphrase of the original question.\n\
+- The new correct answer must be semantically different from the original correct answer, not just moved to another label.\n\
+- Do not merely shuffle labels or reorder options while keeping the same underlying correct answer.\n\
+- Keep the generated question self-contained and answerable from its own stem and options.\n\
+- Keep the same option labels set: {original_labels}.\n\
+- The ordered option texts must not be identical to the original ordered option texts.\n\
+- Prefer small but meaningful semantic changes: change a condition, scope, target, negation, quantity, time, entity, or ask for the opposite/exception.\n\
+- The best questions look similar at first glance, but the truly correct answer changes.\n\
+- Avoid useless edits such as synonym-only rewrites that do not change the answer.\n\
+- Do not output markdown, explanations outside JSON, or any extra keys.\n\
+- The generated set should be diverse; do not output near-duplicates of each other.\n\n\
+Original sample:\n\
+{}\n\n\
+Structured original question:\n{}{}\n",
         serde_json::to_string_pretty(&json!({
             "sample_id": sample.sample_id,
-            "subject": sample.subject,
-            "prompt": sample.prompt,
-            "ref_answer": sample.ref_answer,
-        }))?
+            "original_user": original_user,
+            "preamble": sample.source_mcq.preamble,
+            "question": sample.source_mcq.question,
+            "choices": sample.source_mcq.choices,
+            "original_correct_answer": sample.original_correct_answer,
+            "original_correct_choice_text": original_correct_text,
+        }))?,
+        serde_json::to_string_pretty(&json!({
+            "question_count": variant_count,
+            "choice_count": choice_count,
+        }))?,
+        feedback_block
     ))
 }
 
-fn parse_generated_users(text: &str, expected: usize) -> Result<Vec<String>> {
-    let value: Value = serde_json::from_str(text).context("generator did not return valid JSON")?;
-    let items = value
-        .get("questions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("generator response must be an object with questions[]"))?;
-    collect_users(items, expected)
-}
-
-fn collect_users(items: &[Value], expected: usize) -> Result<Vec<String>> {
+fn parse_generated_questions(
+    text: &str,
+    expected: usize,
+    sample: &SourceSample,
+) -> Result<Vec<GeneratedQuestionItem>> {
+    let envelope: GeneratedQuestionsEnvelope =
+        serde_json::from_str(text).context("generator did not return valid JSON")?;
     ensure!(
-        items.len() == expected,
+        envelope.questions.len() == expected,
         "expected exactly {expected} generated questions, got {}",
-        items.len()
+        envelope.questions.len()
     );
-    items.iter().map(generated_user_text).collect()
+
+    let mut seen_rendered = Vec::<String>::new();
+    let mut out = Vec::with_capacity(envelope.questions.len());
+    for (index, item) in envelope.questions.into_iter().enumerate() {
+        let validated = validate_generated_question(item, sample)
+            .with_context(|| format!("generated question #{index} failed validation"))?;
+        let rendered = render_generated_user(
+            &sample.source_mcq.preamble,
+            &validated.question,
+            &validated.choices,
+        );
+        let normalized_rendered = normalize_compare_text(&rendered);
+        ensure!(
+            !seen_rendered
+                .iter()
+                .any(|existing| existing == &normalized_rendered),
+            "generated question #{index} is a duplicate of another generated question"
+        );
+        seen_rendered.push(normalized_rendered);
+        out.push(validated);
+    }
+    Ok(out)
 }
 
-fn generated_user_text(value: &Value) -> Result<String> {
-    let user = value
-        .get("user")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_owned();
-    ensure!(!user.is_empty(), "generated user prompt is empty");
-    Ok(user)
+fn validate_generated_question(
+    mut item: GeneratedQuestionItem,
+    sample: &SourceSample,
+) -> Result<GeneratedQuestionItem> {
+    item.question = item.question.trim().to_owned();
+    item.change_summary = item.change_summary.trim().to_owned();
+    item.correct_answer = normalize_answer_label(&item.correct_answer)
+        .ok_or_else(|| anyhow!("correct_answer must start with an option label"))?;
+    ensure!(
+        !item.question.is_empty(),
+        "generated question stem is empty"
+    );
+    ensure!(
+        !item.change_summary.is_empty(),
+        "generated change_summary is empty"
+    );
+    ensure!(
+        item.choices.len() == sample.source_mcq.choices.len(),
+        "generated question must contain exactly {} choices, got {}",
+        sample.source_mcq.choices.len(),
+        item.choices.len()
+    );
+
+    for choice in &mut item.choices {
+        choice.label = normalize_answer_label(&choice.label)
+            .ok_or_else(|| anyhow!("choice label must start with an option letter"))?;
+        choice.text = choice.text.trim().to_owned();
+        ensure!(
+            !choice.text.is_empty(),
+            "generated choice {} is empty",
+            choice.label
+        );
+    }
+
+    let expected_labels = expected_labels(item.choices.len());
+    let actual_labels = item
+        .choices
+        .iter()
+        .map(|choice| choice.label.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        actual_labels == expected_labels,
+        "generated choices must use sequential labels {:?}, got {:?}",
+        expected_labels,
+        actual_labels
+    );
+    ensure!(
+        item.correct_answer != sample.original_correct_answer,
+        "generated correct answer {} is unchanged from the original answer",
+        item.correct_answer
+    );
+
+    let generated_correct_text =
+        choice_text(&item.choices, &item.correct_answer).ok_or_else(|| {
+            anyhow!(
+                "generated correct answer {} is missing from choices",
+                item.correct_answer
+            )
+        })?;
+    let original_correct_text =
+        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
+            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
+    ensure!(
+        !texts_too_similar(generated_correct_text, original_correct_text),
+        "generated correct choice text is still too similar to the original correct answer"
+    );
+
+    let generated_question_norm = normalize_compare_text(&item.question);
+    let original_question_norm = normalize_compare_text(&sample.source_mcq.question);
+    let generated_choice_texts = item
+        .choices
+        .iter()
+        .map(|choice| normalize_compare_text(&choice.text))
+        .collect::<Vec<_>>();
+    let original_choice_texts = sample
+        .source_mcq
+        .choices
+        .iter()
+        .map(|choice| normalize_compare_text(&choice.text))
+        .collect::<Vec<_>>();
+    ensure!(
+        generated_question_norm != original_question_norm
+            || generated_choice_texts != original_choice_texts,
+        "generated question is effectively identical to the original question"
+    );
+    ensure!(
+        generated_choice_texts != original_choice_texts,
+        "generated options are identical to the original ordered options"
+    );
+
+    Ok(item)
+}
+
+async fn validate_generated_questions_with_model(
+    client: &OpenAiClient,
+    model: &ModelConfig,
+    sample: &SourceSample,
+    generated: &[GeneratedQuestionItem],
+) -> Result<()> {
+    let prompt = build_generation_validation_prompt(sample, generated)?;
+    let result = client
+        .chat(model, &prompt, true)
+        .await
+        .with_context(|| format!("validator failed for sample {}", sample.sample_id))?;
+    let envelope: ValidationEnvelope =
+        serde_json::from_str(&result.content).context("validator did not return valid JSON")?;
+    ensure!(
+        envelope.items.len() == generated.len(),
+        "validator returned {} items, expected {}",
+        envelope.items.len(),
+        generated.len()
+    );
+
+    let invalid_reasons = envelope
+        .items
+        .into_iter()
+        .filter(|item| !item.valid)
+        .map(|item| format!("#{} {}", item.index, item.reason.trim()))
+        .collect::<Vec<_>>();
+    ensure!(
+        invalid_reasons.is_empty(),
+        "model validation rejected generated questions: {}",
+        invalid_reasons.join(" | ")
+    );
+    Ok(())
+}
+
+fn build_generation_validation_prompt(
+    sample: &SourceSample,
+    generated: &[GeneratedQuestionItem],
+) -> Result<String> {
+    let original_correct_text =
+        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
+            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
+    Ok(format!(
+        "You are a strict validator for multiple-choice question transformations.\n\
+Return only JSON.\n\
+The response must be a single JSON object with exactly one key named \"items\".\n\
+The value of \"items\" must be an array with one object per candidate.\n\
+Each object must contain exactly these keys: \"index\", \"valid\", \"reason\".\n\n\
+Mark a candidate as valid only if ALL of the following are true:\n\
+- It stays in the same subject/domain as the original.\n\
+- It is not a paraphrase of the original question.\n\
+- The new correct answer is truly different from the original correct answer in substance, not just in label position.\n\
+- The candidate is answerable from its own stem and choices.\n\
+- The declared correct_answer matches the best answer for the new question.\n\
+- The change is meaningful rather than a useless cosmetic rewrite.\n\n\
+Original question:\n{}\n\n\
+Candidates:\n{}\n",
+        serde_json::to_string_pretty(&json!({
+            "sample_id": sample.sample_id,
+            "question": sample.source_mcq.question,
+            "choices": sample.source_mcq.choices,
+            "original_correct_answer": sample.original_correct_answer,
+            "original_correct_choice_text": original_correct_text,
+        }))?,
+        serde_json::to_string_pretty(
+            &generated
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    json!({
+                        "index": index,
+                        "question": item.question,
+                        "choices": item.choices,
+                        "correct_answer": item.correct_answer,
+                        "change_summary": item.change_summary,
+                    })
+                })
+                .collect::<Vec<_>>()
+        )?
+    ))
+}
+
+fn render_generated_user(preamble: &str, question: &str, choices: &[Choice]) -> String {
+    let mut lines = Vec::<String>::new();
+    if !preamble.trim().is_empty() {
+        lines.push(preamble.trim().to_owned());
+    }
+
+    let mut question_lines = question.trim().lines();
+    if let Some(first) = question_lines.next() {
+        lines.push(format!("Question: {}", first.trim()));
+    }
+    lines.extend(question_lines.map(|line| line.trim_end().to_owned()));
+    lines.push("Choices:".to_owned());
+    lines.extend(
+        choices
+            .iter()
+            .map(|choice| format!("{}. {}", choice.label, choice.text.trim())),
+    );
+    lines.join("\n")
+}
+
+fn normalize_compare_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !ch.is_ascii_punctuation()
+                && !matches!(
+                    ch,
+                    '，' | '。'
+                        | '：'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '（'
+                        | '）'
+                        | '【'
+                        | '】'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '、'
+                )
+        })
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn texts_too_similar(left: &str, right: &str) -> bool {
+    let left = normalize_compare_text(left);
+    let right = normalize_compare_text(right);
+    if left == right {
+        return true;
+    }
+    let (shorter, longer) = if left.len() <= right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    !shorter.is_empty() && longer.contains(shorter) && shorter.len() * 5 >= longer.len() * 4
 }
 
 fn parse_chat_result(body: &str) -> Result<ChatResult> {
@@ -710,17 +1387,80 @@ fn parse_chat_result(body: &str) -> Result<ChatResult> {
         .map(str::trim)
         .unwrap_or_default()
         .to_owned();
-    let reasoning = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned);
+    let reasoning = ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|key| {
+            message
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        });
     ensure!(
         !content.is_empty() || reasoning.is_some(),
         "chat response is empty"
     );
     Ok(ChatResult { content, reasoning })
+}
+
+fn parse_stream_chat_result(body: &str) -> Result<ChatResult> {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut saw_chunk = false;
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+
+        let value = serde_json::from_str::<Value>(data).with_context(|| {
+            format!(
+                "stream chunk is not valid JSON: {:?}",
+                preview_text(data, 120)
+            )
+        })?;
+        saw_chunk = true;
+
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let delta = choice
+                .get("delta")
+                .or_else(|| choice.get("message"))
+                .unwrap_or(choice);
+            append_chunk_text(delta, "reasoning_content", &mut reasoning);
+            append_chunk_text(delta, "reasoning", &mut reasoning);
+            append_chunk_text(delta, "content", &mut content);
+        }
+    }
+
+    ensure!(saw_chunk, "stream response did not contain any data chunks");
+    let content = content.trim().to_owned();
+    let reasoning = reasoning.trim().to_owned();
+    ensure!(
+        !content.is_empty() || !reasoning.is_empty(),
+        "chat stream response is empty"
+    );
+    Ok(ChatResult {
+        content,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+    })
+}
+
+fn append_chunk_text(value: &Value, key: &str, out: &mut String) {
+    if let Some(text) = value.get(key).and_then(Value::as_str) {
+        out.push_str(text);
+    }
 }
 
 fn merge_assistant(reasoning: Option<String>, content: String) -> String {
@@ -738,16 +1478,13 @@ fn rwkv_text(user: &str, assistant: &str) -> String {
 fn generated_output_row(task: &PendingTask) -> OutputRow {
     OutputRow {
         task_id: task.task_id.clone(),
-        sample_id: task.sample_id.clone(),
-        subject: task.subject.clone(),
-        prompt: task.prompt.clone(),
-        ref_answer: task.ref_answer.clone(),
         status: RunStatus::Generated.as_str().to_owned(),
-        generator_model: task.generator_model.clone(),
         user: task.user.clone(),
+        generated_correct_answer: task.generated_correct_answer.clone(),
+        change_summary: task.change_summary.clone(),
+        answer_model: String::new(),
         assistant: String::new(),
         text: String::new(),
-        answer_model: String::new(),
     }
 }
 
@@ -858,23 +1595,20 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 }
 
 fn load_resume_rows(path: &Path) -> Result<HashMap<String, OutputRow>> {
-    let mut rows = HashMap::new();
-    for row in read_jsonl_if_exists::<OutputRow>(path, "output")? {
-        rows.insert(row.task_id.clone(), row);
-    }
-    Ok(rows)
+    Ok(read_jsonl_if_exists::<OutputRow>(path, "output")?
+        .into_iter()
+        .map(|row| (row.task_id.clone(), row))
+        .collect())
 }
 
 fn summarize_resume_rows(rows: &HashMap<String, OutputRow>) -> Result<(usize, usize)> {
-    let mut generated = 0usize;
-    let mut done = 0usize;
-    for row in rows.values() {
-        match parse_row_status(row)? {
-            RunStatus::Generated => generated += 1,
-            RunStatus::Done => done += 1,
-        }
-    }
-    Ok((generated, done))
+    rows.values()
+        .try_fold((0usize, 0usize), |(generated, done), row| {
+            Ok(match parse_row_status(row)? {
+                RunStatus::Generated => (generated + 1, done),
+                RunStatus::Done => (generated, done + 1),
+            })
+        })
 }
 
 fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
@@ -886,12 +1620,9 @@ fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
     );
     Ok(PendingTask {
         task_id: row.task_id.clone(),
-        sample_id: row.sample_id.clone(),
-        subject: row.subject.clone(),
-        prompt: row.prompt.clone(),
-        ref_answer: row.ref_answer.clone(),
-        generator_model: row.generator_model.clone(),
         user: user.to_owned(),
+        generated_correct_answer: row.generated_correct_answer.trim().to_owned(),
+        change_summary: row.change_summary.trim().to_owned(),
     })
 }
 
@@ -955,14 +1686,25 @@ fn concurrency_limit(configured: usize, total: usize) -> usize {
     configured.max(1).min(total.max(1))
 }
 
-fn default_subject() -> String {
-    "general".to_owned()
-}
+default_value!(default_subject, String, "general".to_owned());
+default_value!(
+    default_output_jsonl_path,
+    PathBuf,
+    PathBuf::from("data/rwkv_train.jsonl")
+);
+default_value!(default_resume, bool, true);
+default_value!(default_request_timeout_seconds, f64, 240.0);
+default_value!(default_disable_env_proxy, bool, true);
+default_value!(default_force_http1, bool, true);
+default_value!(default_generate_requests, usize, 4);
+default_value!(default_answer_requests, usize, 16);
+default_value!(default_generation_attempts, usize, 4);
+default_value!(default_validate_generated_questions, bool, true);
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            jsonl_path: PathBuf::from("data/rwkv_train.jsonl"),
+            jsonl_path: default_output_jsonl_path(),
         }
     }
 }
@@ -970,10 +1712,10 @@ impl Default for OutputConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            resume: true,
-            request_timeout_seconds: 240.0,
-            disable_env_proxy: true,
-            force_http1: true,
+            resume: default_resume(),
+            request_timeout_seconds: default_request_timeout_seconds(),
+            disable_env_proxy: default_disable_env_proxy(),
+            force_http1: default_force_http1(),
         }
     }
 }
@@ -981,8 +1723,8 @@ impl Default for RunConfig {
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
-            generate_requests: 4,
-            answer_requests: 16,
+            generate_requests: default_generate_requests(),
+            answer_requests: default_answer_requests(),
         }
     }
 }

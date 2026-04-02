@@ -10,6 +10,8 @@ endpoint = "https://api.ablai.top/v1/chat/completions"
 model_name = "gpt-5.4"
 api_key = "YOUR_API_KEY"
 variant_count = 10
+generation_attempts = 4
+validate_generated_questions = true
 max_completion_tokens = 512
 
 [[answer_models]]

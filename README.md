@@ -4,7 +4,7 @@
 
 - 从本地 JSONL 读取样本，坏行直接跳过，不做修复
 - 固定读取顶层字段：`task_id`、`sample_index`、`completions_id`、`context`、`ref_answer`
-- 用一个显式配置好的 OpenAI 兼容模型生成 `variant_count` 条变种 `user`
+- 用一个显式配置好的 OpenAI 兼容模型生成 `variant_count` 条“相关但答案必须变化”的新题 `user`
 - 为每条变种稳定随机选一个答案模型作答，保留思维链，不做正确性门控
 - 生成或回答某一题失败时直接跳过，不中断整批
 - 用一个追加写入的输出 JSONL 记录阶段状态，最终 `done` 行保留 RWKV 微调可用的 `text` 字段
@@ -43,6 +43,8 @@ endpoint = "https://api.ablai.top/v1/chat/completions"
 model_name = "gpt-5.4"
 api_key = "YOUR_API_KEY"
 variant_count = 4
+generation_attempts = 4
+validate_generated_questions = true
 
 [[answer_models]]
 endpoint = "https://api.ablai.top/v1/chat/completions"
@@ -60,6 +62,7 @@ api_key = "YOUR_API_KEY"
 - `sample_id = task_id + "_" + sample_index + "_" + completions_id`
 - `prompt = context`
 - `ref_answer = ref_answer`
+- `context` 里的 `User:` 内容当前必须能解析出标准选择题结构：至少包含 `Question:` 和 `Choices:`
 
 例如：
 
@@ -77,20 +80,24 @@ dataset_path = "cmmlu_task122_failed_contexts.jsonl"
 - `task_id`
 - `status`
 - `user`
+- `generated_correct_answer`
+- `change_summary`
 - `assistant`
 - `text`
 
 其中：
 
 - `status` 是流水线运行状态，不再保留输入里的原始状态；当前会写入 `generated` 或 `done`
-- `user` 是第一阶段生成出来的变种问题，也就是 `questions[].user`
+- `user` 是第一阶段生成出来的新题
+- `generated_correct_answer` 是生成模型声明的新题正确选项
+- `change_summary` 是生成模型给出的“这题到底改了什么”的简短说明
 - `assistant` 是回答模型的原始回答拼接结果：如果返回了 `reasoning_content`，就会包成 `<think>...</think>` 并和正文直接拼接
 - `text` 是训练用字段，格式固定为 `User: {user}\nAssistant: {assistant}`
 
 示例：
 
 ```json
-{"task_id":"demo_001_q000","sample_id":"demo_001","subject":"coding","prompt":"什么是冒泡排序？","ref_answer":"一种基础排序算法","status":"done","generator_model":"gpt-5.4","user":"请解释一下什么是冒泡排序","assistant":"<think>\n...\n</think>\n\n冒泡排序是一种基础排序算法。它会重复遍历数组，比较相邻两个元素，如果顺序错误就交换它们。每一轮都会把一个较大的元素“冒”到后面。","text":"User: 请解释一下什么是冒泡排序\nAssistant: <think>\n...\n</think>\n\n冒泡排序是一种基础排序算法。它会重复遍历数组，比较相邻两个元素，如果顺序错误就交换它们。每一轮都会把一个较大的元素“冒”到后面。","answer_model":"deepseek-reasoner"}
+{"task_id":"demo_001_q000","status":"done","user":"Question: 下列排序算法中，哪一种平均时间复杂度为 O(n log n)？\nChoices:\nA. 冒泡排序\nB. 插入排序\nC. 选择排序\nD. 归并排序","generated_correct_answer":"D","change_summary":"把原题从定义题改成复杂度判别题，正确答案从“冒泡排序”换成“归并排序”。","assistant":"<think>\n...\n</think>\n\nD","text":"User: Question: 下列排序算法中，哪一种平均时间复杂度为 O(n log n)？\nChoices:\nA. 冒泡排序\nB. 插入排序\nC. 选择排序\nD. 归并排序\nAssistant: <think>\n...\n</think>\n\nD","answer_model":"deepseek-reasoner"}
 ```
 
 ### 续跑逻辑
@@ -108,6 +115,16 @@ dataset_path = "cmmlu_task122_failed_contexts.jsonl"
 - 回答成功后再追加一条 `done`
 
 恢复时按同一个 `task_id` 的最新状态决定跳过哪个阶段。这样如果生成完成后中断，下次会直接复用已落盘的 `user`，不会再次调用生成模型。
+
+### 生成约束
+
+当前生成阶段不再接受“同题改写”。每条新题都必须同时满足：
+
+- 和原题相关，但不是原题同义改写
+- 正确答案必须变化
+- 新正确答案的内容不能只是把原正确选项换个字母位置
+- 选项整体不能与原题按原顺序完全一致
+- 本地结构校验不通过，或模型二次校验不通过，都会自动重试
 
 ### 静态检查
 

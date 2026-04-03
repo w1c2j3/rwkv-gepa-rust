@@ -77,6 +77,8 @@ struct GeneratorConfig {
     generation_attempts: usize,
     #[serde(default = "default_validate_generated_questions")]
     validate_generated_questions: bool,
+    #[serde(default = "default_generator_json_object_response")]
+    json_object_response: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -144,7 +146,6 @@ struct PendingTask {
     task_id: String,
     user: String,
     generated_correct_answer: String,
-    change_summary: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -159,8 +160,6 @@ struct OutputRow {
     user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     generated_correct_answer: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    change_summary: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     answer_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -185,16 +184,22 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GeneratedQuestionsEnvelope {
-    questions: Vec<GeneratedQuestionItem>,
+    questions: Vec<GeneratedQuestionDraft>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct GeneratedQuestionDraft {
+    new_question: String,
+    new_choices: Vec<String>,
+    new_correct_answer: String,
+}
+
+#[derive(Debug)]
 struct GeneratedQuestionItem {
     question: String,
     choices: Vec<Choice>,
     correct_answer: String,
-    change_summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,87 +432,159 @@ async fn generate_tasks(
     generator: GeneratorConfig,
     job: GenerateJob,
 ) -> Result<Vec<PendingTask>> {
-    let generate_count = job.missing_indices.len();
-    let mut feedback = None::<String>;
+    let mut accepted = Vec::<PendingTask>::new();
+    let total_target_count = job.missing_indices.len();
 
-    for attempt in 0..generator.generation_attempts {
-        let prompt = build_generation_prompt(&job.sample, generate_count, feedback.as_deref())?;
-        let result = client
-            .chat(&generator.model, &prompt, true)
-            .await
-            .with_context(|| format!("generator failed for sample {}", job.sample.sample_id))?;
-        let generated = parse_generated_questions(&result.content, generate_count, &job.sample)
-            .with_context(|| {
-                format!(
-                    "invalid generated questions for sample {} on logical attempt {}/{}",
-                    job.sample.sample_id,
-                    attempt + 1,
-                    generator.generation_attempts
-                )
-            });
+    for index in &job.missing_indices {
+        let mut feedback = None::<String>;
+        let mut last_error = None::<anyhow::Error>;
 
-        let generated = match generated {
-            Ok(generated) => generated,
-            Err(err) if attempt + 1 < generator.generation_attempts => {
-                feedback = Some(err.to_string());
-                eprintln!(
-                    "retrying generation for {} after parse/validation failure on attempt {}/{}: {}",
-                    job.sample.sample_id,
-                    attempt + 1,
-                    generator.generation_attempts,
-                    err
-                );
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-
-        if generator.validate_generated_questions {
-            if let Err(err) = validate_generated_questions_with_model(
-                &client,
-                &generator.model,
+        for attempt in 0..generator.generation_attempts {
+            let prompt = build_generation_prompt(
                 &job.sample,
-                &generated,
-            )
-            .await
+                total_target_count,
+                &accepted,
+                feedback.as_deref(),
+            )?;
+            let result = client
+                .chat(
+                    &generator.model,
+                    &prompt,
+                    generator.json_object_response,
+                )
+                .await
+                .with_context(|| format!("generator failed for sample {}", job.sample.sample_id));
+
+            let generated = match result {
+                Ok(result) => parse_generated_questions(&result.content, 1, &job.sample)
+                    .and_then(|mut items| {
+                        items.pop().ok_or_else(|| anyhow!("generator returned no questions"))
+                    })
+                    .with_context(|| {
+                        format!(
+                            "invalid generated question for sample {} target index {} on logical attempt {}/{}",
+                            job.sample.sample_id,
+                            index,
+                            attempt + 1,
+                            generator.generation_attempts
+                        )
+                    }),
+                Err(err) => Err(err),
+            };
+
+            let generated = match generated {
+                Ok(generated) => generated,
+                Err(err) if attempt + 1 < generator.generation_attempts => {
+                    feedback = Some(err.to_string());
+                    last_error = Some(err);
+                    eprintln!(
+                        "retrying generation for {} target index {} after parse/validation failure on attempt {}/{}",
+                        job.sample.sample_id,
+                        index,
+                        attempt + 1,
+                        generator.generation_attempts
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if generator.validate_generated_questions {
+                if let Err(err) = validate_generated_questions_with_model(
+                    &client,
+                    &generator.model,
+                    &job.sample,
+                    std::slice::from_ref(&generated),
+                )
+                .await
+                {
+                    if attempt + 1 < generator.generation_attempts {
+                        feedback = Some(err.to_string());
+                        last_error = Some(err);
+                        eprintln!(
+                            "retrying generation for {} target index {} after model validation failure on attempt {}/{}",
+                            job.sample.sample_id,
+                            index,
+                            attempt + 1,
+                            generator.generation_attempts
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+
+            let user = render_generated_user(
+                &job.sample.source_mcq.preamble,
+                &generated.question,
+                &generated.choices,
+            );
+            let normalized_user = normalize_compare_text(&user);
+            if accepted
+                .iter()
+                .any(|task| normalize_compare_text(&task.user) == normalized_user)
             {
+                let err = anyhow!(
+                    "generated question duplicates an already accepted variant for sample {}",
+                    job.sample.sample_id
+                );
                 if attempt + 1 < generator.generation_attempts {
                     feedback = Some(err.to_string());
+                    last_error = Some(err);
                     eprintln!(
-                        "retrying generation for {} after model validation failure on attempt {}/{}: {}",
+                        "retrying generation for {} target index {} after duplicate detection on attempt {}/{}",
                         job.sample.sample_id,
+                        index,
                         attempt + 1,
-                        generator.generation_attempts,
-                        err
+                        generator.generation_attempts
                     );
                     continue;
                 }
                 return Err(err);
             }
+
+            let is_last_slot = accepted.len() + 1 == total_target_count;
+            if total_target_count > 1 && is_last_slot {
+                let distinct_labels = accepted
+                    .iter()
+                    .map(|task| task.generated_correct_answer.as_str())
+                    .chain(std::iter::once(generated.correct_answer.as_str()))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if distinct_labels.len() < 2 {
+                    let err = anyhow!(
+                        "final generated set would use only one correct-answer label; rewrite this question so the batch covers at least 2 different answer letters"
+                    );
+                    if attempt + 1 < generator.generation_attempts {
+                        feedback = Some(err.to_string());
+                        last_error = Some(err);
+                        eprintln!(
+                            "retrying generation for {} target index {} after answer-label diversity failure on attempt {}/{}",
+                            job.sample.sample_id,
+                            index,
+                            attempt + 1,
+                            generator.generation_attempts
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+
+            accepted.push(PendingTask {
+                task_id: task_id(&job.sample.sample_id, *index),
+                user,
+                generated_correct_answer: generated.correct_answer,
+            });
+            last_error = None;
+            break;
         }
 
-        let tasks = job
-            .missing_indices
-            .iter()
-            .zip(generated.into_iter())
-            .map(|(index, generated)| PendingTask {
-                task_id: task_id(&job.sample.sample_id, *index),
-                user: render_generated_user(
-                    &job.sample.source_mcq.preamble,
-                    &generated.question,
-                    &generated.choices,
-                ),
-                generated_correct_answer: generated.correct_answer,
-                change_summary: generated.change_summary,
-            })
-            .collect();
-        return Ok(tasks);
+        if let Some(err) = last_error {
+            return Err(err);
+        }
     }
 
-    Err(anyhow!(
-        "generator logic unexpectedly exhausted without returning for sample {}",
-        job.sample.sample_id
-    ))
+    Ok(accepted)
 }
 
 async fn answer_task(
@@ -526,7 +603,6 @@ async fn answer_task(
         status: RunStatus::Done.as_str().to_owned(),
         user: task.user,
         generated_correct_answer: task.generated_correct_answer,
-        change_summary: task.change_summary,
         answer_model: model.model_name,
         assistant,
         text,
@@ -1034,7 +1110,8 @@ fn build_resume_plan(
 
 fn build_generation_prompt(
     sample: &SourceSample,
-    variant_count: usize,
+    total_target_count: usize,
+    accepted: &[PendingTask],
     feedback: Option<&str>,
 ) -> Result<String> {
     let original_correct_text =
@@ -1051,38 +1128,49 @@ fn build_generation_prompt(
     let feedback_block = feedback
         .map(|text| {
             format!(
-                "\nPrevious attempt failed. Fix these issues instead of repeating them:\n{}\n",
+                "\n上一轮失败原因：{}\n请只修复这些问题，不要重复犯错。\n",
                 text
             )
         })
         .unwrap_or_default();
-
+    let accepted_block = if accepted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "已接受题：{}\n",
+            serde_json::to_string(
+                &accepted
+                    .iter()
+                    .map(|task| {
+                        json!({
+                            "user": task.user,
+                            "answer": task.generated_correct_answer,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )?
+        )
+    };
+    let diversity_block = if total_target_count > 1 {
+        let accepted_labels = accepted
+            .iter()
+            .map(|task| task.generated_correct_answer.as_str())
+            .collect::<Vec<_>>();
+        format!(
+            "\n本样本总共需要生成 {total_target_count} 道新题。当前已接受 {} 道，新题正确答案字母依次为 {:?}。最终整组结果至少要覆盖 2 种不同的正确答案字母。\n",
+            accepted.len(),
+            accepted_labels
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "You are creating closely related but answer-changing multiple-choice questions for RWKV training.\n\
-Return only JSON.\n\
-The response must be a single JSON object with exactly one key named \"questions\".\n\
-The value of \"questions\" must be an array of exactly {variant_count} objects.\n\
-Each object must contain exactly these keys:\n\
-- \"question\": the new question stem only, without any \"Question:\" prefix\n\
-- \"choices\": an array of exactly {choice_count} objects, each with exactly two keys: \"label\" and \"text\"\n\
-- \"correct_answer\": the single correct option label\n\
-- \"change_summary\": a short Chinese sentence explaining what semantic pivot changed and why the answer changed\n\n\
-Hard requirements for every generated item:\n\
-- It must stay in the same subject/domain as the original question.\n\
-- It must be a new question, not a paraphrase of the original question.\n\
-- The new correct answer must be semantically different from the original correct answer, not just moved to another label.\n\
-- Do not merely shuffle labels or reorder options while keeping the same underlying correct answer.\n\
-- Keep the generated question self-contained and answerable from its own stem and options.\n\
-- Keep the same option labels set: {original_labels}.\n\
-- The ordered option texts must not be identical to the original ordered option texts.\n\
-- Prefer small but meaningful semantic changes: change a condition, scope, target, negation, quantity, time, entity, or ask for the opposite/exception.\n\
-- The best questions look similar at first glance, but the truly correct answer changes.\n\
-- Avoid useless edits such as synonym-only rewrites that do not change the answer.\n\
-- Do not output markdown, explanations outside JSON, or any extra keys.\n\
-- The generated set should be diverse; do not output near-duplicates of each other.\n\n\
-Original sample:\n\
-{}\n\n\
-Structured original question:\n{}{}\n",
+        "生成1道与原题相关但本质不同的新选择题。\n\
+先换掉原正确答案，再重写题干和4个选项，使 new_correct_answer 成为唯一正确答案。\n\
+返回纯JSON：{{\"questions\":[{{\"new_question\":\"...\",\"new_choices\":[\"A. ...\",\"B. ...\",\"C. ...\",\"D. ...\"],\"new_correct_answer\":\"A\"}}]}}\n\
+要求：同知识域和风格；不是同义改写；不再问原题同一个判断对象；至少改一个决定答案的判定点；new_correct_answer 不能等于原答案，新的正确选项内容也不能等于原答案内容；4个选项全部重写、同层级、不能复用原选项文本或仅换序；题面本身足以唯一判断；不要角色扮演；不要冷门特例；不要与已接受题重复。\n\
+自检：不是原题，不是表述改写，先换答案再重写，原答案未保留，只有一个合理答案。\n\
+原始样本：{}\n{}{}输出结构：{}\n{}",
         serde_json::to_string_pretty(&json!({
             "sample_id": sample.sample_id,
             "original_user": original_user,
@@ -1092,9 +1180,12 @@ Structured original question:\n{}{}\n",
             "original_correct_answer": sample.original_correct_answer,
             "original_correct_choice_text": original_correct_text,
         }))?,
+        accepted_block,
+        diversity_block,
         serde_json::to_string_pretty(&json!({
-            "question_count": variant_count,
+            "question_count": 1,
             "choice_count": choice_count,
+            "option_labels": original_labels,
         }))?,
         feedback_block
     ))
@@ -1105,8 +1196,7 @@ fn parse_generated_questions(
     expected: usize,
     sample: &SourceSample,
 ) -> Result<Vec<GeneratedQuestionItem>> {
-    let envelope: GeneratedQuestionsEnvelope =
-        serde_json::from_str(text).context("generator did not return valid JSON")?;
+    let envelope = parse_generated_questions_envelope(text)?;
     ensure!(
         envelope.questions.len() == expected,
         "expected exactly {expected} generated questions, got {}",
@@ -1115,8 +1205,8 @@ fn parse_generated_questions(
 
     let mut seen_rendered = Vec::<String>::new();
     let mut out = Vec::with_capacity(envelope.questions.len());
-    for (index, item) in envelope.questions.into_iter().enumerate() {
-        let validated = validate_generated_question(item, sample)
+    for (index, draft) in envelope.questions.into_iter().enumerate() {
+        let validated = validate_generated_question(draft, sample)
             .with_context(|| format!("generated question #{index} failed validation"))?;
         let rendered = render_generated_user(
             &sample.source_mcq.preamble,
@@ -1136,22 +1226,121 @@ fn parse_generated_questions(
     Ok(out)
 }
 
+fn parse_generated_questions_envelope(text: &str) -> Result<GeneratedQuestionsEnvelope> {
+    serde_json::from_str(text)
+        .or_else(|_| {
+            extract_json_object_from_text(text)
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no json object")))
+                .and_then(|json| serde_json::from_str(&json))
+        })
+        .with_context(|| {
+            format!(
+                "generator did not return valid JSON or an extractable JSON object: {:?}",
+                preview_text(text, 200)
+            )
+        })
+}
+
+fn extract_json_object_from_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for segment in trimmed.split("```").skip(1).step_by(2) {
+        if let Some(json) = extract_first_balanced_json_object(segment) {
+            return Some(json);
+        }
+    }
+
+    extract_first_balanced_json_object(trimmed)
+}
+
+fn extract_first_balanced_json_object(text: &str) -> Option<String> {
+    let mut start = None::<usize>;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in text.char_indices() {
+        if let Some(object_start) = start {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(text[object_start..index + ch.len_utf8()].trim().to_owned());
+                    }
+                }
+                _ => {}
+            }
+        } else if ch == '{' {
+            start = Some(index);
+            depth = 1;
+        }
+    }
+
+    None
+}
+
 fn validate_generated_question(
-    mut item: GeneratedQuestionItem,
+    mut draft: GeneratedQuestionDraft,
     sample: &SourceSample,
 ) -> Result<GeneratedQuestionItem> {
-    item.question = item.question.trim().to_owned();
-    item.change_summary = item.change_summary.trim().to_owned();
-    item.correct_answer = normalize_answer_label(&item.correct_answer)
+    draft.new_question = draft.new_question.trim().to_owned();
+    draft.new_correct_answer = normalize_answer_label(&draft.new_correct_answer)
         .ok_or_else(|| anyhow!("correct_answer must start with an option label"))?;
+
     ensure!(
-        !item.question.is_empty(),
+        !draft.new_question.is_empty(),
         "generated question stem is empty"
     );
     ensure!(
-        !item.change_summary.is_empty(),
-        "generated change_summary is empty"
+        !draft.new_question.contains("Question:"),
+        "generated new_question must not contain a Question: prefix"
     );
+    ensure!(
+        !draft.new_question.contains("Choices:"),
+        "generated new_question must not contain a Choices: block"
+    );
+
+    let choices = draft
+        .new_choices
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let trimmed = line.trim();
+            let (label, text) = parse_choice_line(trimmed).ok_or_else(|| {
+                anyhow!(
+                    "generated new_choices[{}] must look like \"A. ...\", got {:?}",
+                    index,
+                    preview_text(trimmed, 80)
+                )
+            })?;
+            Ok(Choice { label, text })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut item = GeneratedQuestionItem {
+        question: draft.new_question,
+        choices,
+        correct_answer: draft.new_correct_answer,
+    };
+
     ensure!(
         item.choices.len() == sample.source_mcq.choices.len(),
         "generated question must contain exactly {} choices, got {}",
@@ -1225,6 +1414,50 @@ fn validate_generated_question(
         generated_choice_texts != original_choice_texts,
         "generated options are identical to the original ordered options"
     );
+    let mut generated_choice_texts_sorted = generated_choice_texts.clone();
+    generated_choice_texts_sorted.sort();
+    let mut original_choice_texts_sorted = original_choice_texts.clone();
+    original_choice_texts_sorted.sort();
+    ensure!(
+        generated_choice_texts_sorted != original_choice_texts_sorted,
+        "generated options are just the original options in a different order"
+    );
+
+    let reused_choice_count = item
+        .choices
+        .iter()
+        .filter(|choice| {
+            sample
+                .source_mcq
+                .choices
+                .iter()
+                .any(|original| texts_too_similar(&choice.text, &original.text))
+        })
+        .count();
+    ensure!(
+        reused_choice_count + 1 < item.choices.len(),
+        "generated options reuse too many original choices; they must be rewritten around the new decision point"
+    );
+
+    let has_duplicate_choice_text =
+        generated_choice_texts
+            .iter()
+            .enumerate()
+            .any(|(index, left)| {
+                generated_choice_texts
+                    .iter()
+                    .skip(index + 1)
+                    .any(|right| left == right)
+            });
+    ensure!(
+        !has_duplicate_choice_text,
+        "generated options contain duplicated choice text"
+    );
+
+    ensure!(
+        !contains_ambiguous_negative_stem(&item.question),
+        "generated question uses an ambiguous negative/exception stem; rewrite it as a positive, uniquely answerable question"
+    );
 
     Ok(item)
 }
@@ -1271,20 +1504,22 @@ fn build_generation_validation_prompt(
         choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
             .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
     Ok(format!(
-        "You are a strict validator for multiple-choice question transformations.\n\
-Return only JSON.\n\
-The response must be a single JSON object with exactly one key named \"items\".\n\
-The value of \"items\" must be an array with one object per candidate.\n\
-Each object must contain exactly these keys: \"index\", \"valid\", \"reason\".\n\n\
-Mark a candidate as valid only if ALL of the following are true:\n\
-- It stays in the same subject/domain as the original.\n\
-- It is not a paraphrase of the original question.\n\
-- The new correct answer is truly different from the original correct answer in substance, not just in label position.\n\
-- The candidate is answerable from its own stem and choices.\n\
-- The declared correct_answer matches the best answer for the new question.\n\
-- The change is meaningful rather than a useless cosmetic rewrite.\n\n\
-Original question:\n{}\n\n\
-Candidates:\n{}\n",
+        "你是选择题变体质检器。\n\
+返回纯 JSON：{{\"items\":[{{\"index\":0,\"valid\":true,\"reason\":\"...\"}}]}}\n\
+items 长度必须与候选题数量一致，每项只能有 index、valid、reason。\n\n\
+只有同时满足以下条件时才判 valid=true：\n\
+1. 保持同一知识域、题型风格、语言风格，表面形式尽量接近原题。\n\
+2. 不是同义改写；如果仍在问原题同一个判断对象，则不通过。\n\
+3. 候选题是先换掉原正确答案，再围绕新答案重写的；不是在原题上只做表面改写。\n\
+4. 至少改动了一个真正决定答案的判定点，例如比较对象、适用条件、规则对象、制度目的、适用范围、概念边界、例外条件、排序依据。\n\
+5. 新正确答案是因为判定依据变化而改变，不是只换字母，也不是原答案内容的近义改写。\n\
+6. 选项围绕新判定点重写，不是原选项复用或换序，且四个选项处于同一概念层级。\n\
+7. 不需要外部检索；题面本身足以支持唯一答案。\n\
+8. 没有退化成特别偏、特别窄或特别冷门的低质量特例题。\n\
+9. declared correct_answer 确实是唯一最佳答案。\n\n\
+不通过时，reason 只写最关键的失败原因，例如：仍是原问题 / 表述改写 / 未先换答案 / 答案未变 / 需要外部检索 / 选项层级不一致 / 题目有歧义。\n\n\
+原始样本：\n{}\n\n\
+候选题：\n{}\n",
         serde_json::to_string_pretty(&json!({
             "sample_id": sample.sample_id,
             "question": sample.source_mcq.question,
@@ -1302,7 +1537,6 @@ Candidates:\n{}\n",
                         "question": item.question,
                         "choices": item.choices,
                         "correct_answer": item.correct_answer,
-                        "change_summary": item.change_summary,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1312,8 +1546,9 @@ Candidates:\n{}\n",
 
 fn render_generated_user(preamble: &str, question: &str, choices: &[Choice]) -> String {
     let mut lines = Vec::<String>::new();
-    if !preamble.trim().is_empty() {
-        lines.push(preamble.trim().to_owned());
+    let sanitized_preamble = sanitize_preamble(preamble);
+    if !sanitized_preamble.is_empty() {
+        lines.push(sanitized_preamble);
     }
 
     let mut question_lines = question.trim().lines();
@@ -1328,6 +1563,51 @@ fn render_generated_user(preamble: &str, question: &str, choices: &[Choice]) -> 
             .map(|choice| format!("{}. {}", choice.label, choice.text.trim())),
     );
     lines.join("\n")
+}
+
+fn sanitize_preamble(preamble: &str) -> String {
+    preamble
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !looks_like_roleplay_line(line))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn looks_like_roleplay_line(line: &str) -> bool {
+    let normalized = line.trim().to_ascii_lowercase();
+    (normalized.starts_with("you are ")
+        || normalized.starts_with("you are a ")
+        || normalized.starts_with("you are an "))
+        && (normalized.contains("expert")
+            || normalized.contains("assistant")
+            || normalized.contains("teacher")
+            || normalized.contains("tutor")
+            || normalized.contains("talented"))
+        || ((line.contains("你是") || line.contains("请你作为"))
+            && (line.contains("专家")
+                || line.contains("老师")
+                || line.contains("助手")
+                || line.contains("顾问")
+                || line.contains("学者")))
+}
+
+fn contains_ambiguous_negative_stem(question: &str) -> bool {
+    [
+        "最不适合",
+        "最不是",
+        "最不能",
+        "最不可能",
+        "最不恰当",
+        "最不属于",
+        "最不正确",
+        "错误的是",
+        "不正确的是",
+    ]
+    .iter()
+    .any(|pattern| question.contains(pattern))
 }
 
 fn normalize_compare_text(text: &str) -> String {
@@ -1481,7 +1761,6 @@ fn generated_output_row(task: &PendingTask) -> OutputRow {
         status: RunStatus::Generated.as_str().to_owned(),
         user: task.user.clone(),
         generated_correct_answer: task.generated_correct_answer.clone(),
-        change_summary: task.change_summary.clone(),
         answer_model: String::new(),
         assistant: String::new(),
         text: String::new(),
@@ -1622,7 +1901,6 @@ fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
         task_id: row.task_id.clone(),
         user: user.to_owned(),
         generated_correct_answer: row.generated_correct_answer.trim().to_owned(),
-        change_summary: row.change_summary.trim().to_owned(),
     })
 }
 
@@ -1700,6 +1978,7 @@ default_value!(default_generate_requests, usize, 4);
 default_value!(default_answer_requests, usize, 16);
 default_value!(default_generation_attempts, usize, 4);
 default_value!(default_validate_generated_questions, bool, true);
+default_value!(default_generator_json_object_response, bool, true);
 
 impl Default for OutputConfig {
     fn default() -> Self {

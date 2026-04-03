@@ -88,6 +88,8 @@ struct ModelConfig {
     model_name: String,
     api_key: String,
     #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
     max_completion_tokens: Option<u32>,
     #[serde(default)]
     reasoning_effort: Option<String>,
@@ -104,6 +106,13 @@ struct ModelConfig {
 struct OutputConfig {
     #[serde(default = "default_output_jsonl_path")]
     jsonl_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct OutputPaths {
+    legacy_jsonl_path: PathBuf,
+    generate_jsonl_path: PathBuf,
+    done_jsonl_path: PathBuf,
 }
 
 #[derive(Clone, Deserialize)]
@@ -131,21 +140,23 @@ struct ConcurrencyConfig {
 #[derive(Clone)]
 struct SourceSample {
     sample_id: String,
-    source_mcq: MultipleChoiceQuestion,
-    original_correct_answer: String,
+    source_user: String,
+    source_meta: Value,
 }
 
 #[derive(Clone)]
 struct GenerateJob {
     sample: SourceSample,
     missing_indices: Vec<usize>,
+    accepted_tasks: Vec<PendingTask>,
 }
 
 #[derive(Clone)]
 struct PendingTask {
     task_id: String,
     user: String,
-    generated_correct_answer: String,
+    expected_answer: String,
+    generated_item_json: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -159,7 +170,13 @@ struct OutputRow {
     )]
     user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    generated_correct_answer: String,
+    generated_item_json: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    expected_answer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    predicted_answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer_correct: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     answer_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -168,38 +185,27 @@ struct OutputRow {
     text: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct MultipleChoiceQuestion {
-    preamble: String,
-    question: String,
-    choices: Vec<Choice>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Choice {
-    label: String,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct GeneratedQuestionsEnvelope {
-    questions: Vec<GeneratedQuestionDraft>,
+struct GeneratedItemsEnvelope {
+    items: Vec<GeneratedItemDraft>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct GeneratedQuestionDraft {
-    new_question: String,
-    new_choices: Vec<String>,
-    new_correct_answer: String,
+struct GeneratedItemDraft {
+    user: String,
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    meta: Value,
 }
 
 #[derive(Debug)]
-struct GeneratedQuestionItem {
-    question: String,
-    choices: Vec<Choice>,
-    correct_answer: String,
+struct GeneratedItem {
+    user: String,
+    answer: String,
+    item_json: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +231,7 @@ enum RunStatus {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: [ChatMessage<'a>; 1],
+    messages: Vec<ChatMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,18 +318,20 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
         return Ok(());
     }
 
-    prepare_output(&cfg)?;
+    let output_paths = build_output_paths(&cfg.output)?;
+    prepare_output(&output_paths, cfg.run.resume)?;
     let resume_rows = if cfg.run.resume {
-        load_resume_rows(&cfg.output.jsonl_path)?
+        load_resume_rows(&output_paths)?
     } else {
         HashMap::new()
     };
     if !resume_rows.is_empty() {
         let (generated, done) = summarize_resume_rows(&resume_rows)?;
         eprintln!(
-            "resuming with {} tracked tasks from {} (generated={}, done={})",
+            "resuming with {} tracked tasks from {} and {} (generated={}, done={})",
             resume_rows.len(),
-            cfg.output.jsonl_path.display(),
+            output_paths.generate_jsonl_path.display(),
+            output_paths.done_jsonl_path.display(),
             generated,
             done
         );
@@ -353,7 +361,7 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
             match result {
                 Ok(tasks) => {
                     let generated_rows = tasks.iter().map(generated_output_row).collect::<Vec<_>>();
-                    append_jsonl(&cfg.output.jsonl_path, &generated_rows)?;
+                    append_jsonl(&output_paths.generate_jsonl_path, &generated_rows)?;
                     generated_now += tasks.len();
                     for task in tasks {
                         pending_tasks.push(task);
@@ -402,7 +410,7 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
     while let Some(result) = stream.next().await {
         match result {
             Ok(row) => {
-                append_jsonl(&cfg.output.jsonl_path, std::slice::from_ref(&row))?;
+                append_jsonl(&output_paths.done_jsonl_path, std::slice::from_ref(&row))?;
                 written += 1;
             }
             Err(err) => {
@@ -432,159 +440,92 @@ async fn generate_tasks(
     generator: GeneratorConfig,
     job: GenerateJob,
 ) -> Result<Vec<PendingTask>> {
-    let mut accepted = Vec::<PendingTask>::new();
-    let total_target_count = job.missing_indices.len();
+    let expected = job.missing_indices.len();
+    let mut feedback = None::<String>;
+    let accepted_norms = job
+        .accepted_tasks
+        .iter()
+        .map(|task| normalize_compare_text(&task.user))
+        .collect::<Vec<_>>();
 
-    for index in &job.missing_indices {
-        let mut feedback = None::<String>;
-        let mut last_error = None::<anyhow::Error>;
+    for attempt in 0..generator.generation_attempts {
+        let prompt = build_generation_prompt(
+            &job.sample,
+            expected,
+            &job.accepted_tasks,
+            feedback.as_deref(),
+        )?;
+        let result = client
+            .chat(&generator.model, &prompt, generator.json_object_response)
+            .await
+            .with_context(|| format!("generator failed for sample {}", job.sample.sample_id));
 
-        for attempt in 0..generator.generation_attempts {
-            let prompt = build_generation_prompt(
-                &job.sample,
-                total_target_count,
-                &accepted,
-                feedback.as_deref(),
-            )?;
-            let result = client
-                .chat(
-                    &generator.model,
-                    &prompt,
-                    generator.json_object_response,
-                )
-                .await
-                .with_context(|| format!("generator failed for sample {}", job.sample.sample_id));
+        let generated = match result {
+            Ok(result) => parse_generated_items(&result.content, expected, &job.sample),
+            Err(err) => Err(err),
+        };
 
-            let generated = match result {
-                Ok(result) => parse_generated_questions(&result.content, 1, &job.sample)
-                    .and_then(|mut items| {
-                        items.pop().ok_or_else(|| anyhow!("generator returned no questions"))
-                    })
-                    .with_context(|| {
-                        format!(
-                            "invalid generated question for sample {} target index {} on logical attempt {}/{}",
-                            job.sample.sample_id,
-                            index,
-                            attempt + 1,
-                            generator.generation_attempts
-                        )
-                    }),
-                Err(err) => Err(err),
-            };
-
-            let generated = match generated {
-                Ok(generated) => generated,
-                Err(err) if attempt + 1 < generator.generation_attempts => {
-                    feedback = Some(err.to_string());
-                    last_error = Some(err);
-                    eprintln!(
-                        "retrying generation for {} target index {} after parse/validation failure on attempt {}/{}",
-                        job.sample.sample_id,
-                        index,
-                        attempt + 1,
-                        generator.generation_attempts
-                    );
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-
-            if generator.validate_generated_questions {
-                if let Err(err) = validate_generated_questions_with_model(
-                    &client,
-                    &generator.model,
-                    &job.sample,
-                    std::slice::from_ref(&generated),
-                )
-                .await
-                {
-                    if attempt + 1 < generator.generation_attempts {
-                        feedback = Some(err.to_string());
-                        last_error = Some(err);
-                        eprintln!(
-                            "retrying generation for {} target index {} after model validation failure on attempt {}/{}",
-                            job.sample.sample_id,
-                            index,
-                            attempt + 1,
-                            generator.generation_attempts
-                        );
-                        continue;
-                    }
-                    return Err(err);
-                }
+        let generated = match generated {
+            Ok(items) => items,
+            Err(err) if attempt + 1 < generator.generation_attempts => {
+                feedback = Some(err.to_string());
+                continue;
             }
+            Err(err) => return Err(err),
+        };
 
-            let user = render_generated_user(
-                &job.sample.source_mcq.preamble,
-                &generated.question,
-                &generated.choices,
-            );
-            let normalized_user = normalize_compare_text(&user);
-            if accepted
+        if let Some(item) = generated.iter().find(|item| {
+            let normalized = normalize_compare_text(&item.user);
+            accepted_norms
                 .iter()
-                .any(|task| normalize_compare_text(&task.user) == normalized_user)
+                .any(|existing| existing == &normalized)
+        }) {
+            let err = anyhow!(
+                "generated item duplicates an already accepted variant: {:?}",
+                preview_text(&item.user, 120)
+            );
+            if attempt + 1 < generator.generation_attempts {
+                feedback = Some(err.to_string());
+                continue;
+            }
+            return Err(err);
+        }
+
+        if generator.validate_generated_questions {
+            let drafts = generated
+                .iter()
+                .map(|item| serde_json::from_str::<GeneratedItemDraft>(&item.item_json))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if let Err(err) =
+                validate_generated_items_with_model(&client, &generator.model, &job.sample, &drafts)
+                    .await
             {
-                let err = anyhow!(
-                    "generated question duplicates an already accepted variant for sample {}",
-                    job.sample.sample_id
-                );
                 if attempt + 1 < generator.generation_attempts {
                     feedback = Some(err.to_string());
-                    last_error = Some(err);
-                    eprintln!(
-                        "retrying generation for {} target index {} after duplicate detection on attempt {}/{}",
-                        job.sample.sample_id,
-                        index,
-                        attempt + 1,
-                        generator.generation_attempts
-                    );
                     continue;
                 }
                 return Err(err);
             }
+        }
 
-            let is_last_slot = accepted.len() + 1 == total_target_count;
-            if total_target_count > 1 && is_last_slot {
-                let distinct_labels = accepted
-                    .iter()
-                    .map(|task| task.generated_correct_answer.as_str())
-                    .chain(std::iter::once(generated.correct_answer.as_str()))
-                    .collect::<std::collections::BTreeSet<_>>();
-                if distinct_labels.len() < 2 {
-                    let err = anyhow!(
-                        "final generated set would use only one correct-answer label; rewrite this question so the batch covers at least 2 different answer letters"
-                    );
-                    if attempt + 1 < generator.generation_attempts {
-                        feedback = Some(err.to_string());
-                        last_error = Some(err);
-                        eprintln!(
-                            "retrying generation for {} target index {} after answer-label diversity failure on attempt {}/{}",
-                            job.sample.sample_id,
-                            index,
-                            attempt + 1,
-                            generator.generation_attempts
-                        );
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-
-            accepted.push(PendingTask {
+        let tasks = generated
+            .into_iter()
+            .zip(job.missing_indices.iter())
+            .map(|(item, index)| PendingTask {
                 task_id: task_id(&job.sample.sample_id, *index),
-                user,
-                generated_correct_answer: generated.correct_answer,
-            });
-            last_error = None;
-            break;
-        }
+                user: item.user,
+                generated_item_json: item.item_json,
+            })
+            .collect::<Vec<_>>();
 
-        if let Some(err) = last_error {
-            return Err(err);
-        }
+        return Ok(tasks);
     }
 
-    Ok(accepted)
+    Err(anyhow!(
+        "failed to generate tasks for {} after {} attempts",
+        job.sample.sample_id,
+        generator.generation_attempts
+    ))
 }
 
 async fn answer_task(
@@ -596,13 +537,18 @@ async fn answer_task(
         .chat(&model, &task.user, false)
         .await
         .with_context(|| format!("answer failed for task {}", task.task_id))?;
-    let assistant = merge_assistant(result.reasoning, result.content);
+    let assistant = merge_answer_output(result.reasoning, result.content);
+    ensure!(
+        !assistant.trim().is_empty(),
+        "answer model returned empty output for task {}",
+        task.task_id
+    );
     let text = rwkv_text(&task.user, &assistant);
     Ok(OutputRow {
         task_id: task.task_id,
         status: RunStatus::Done.as_str().to_owned(),
         user: task.user,
-        generated_correct_answer: task.generated_correct_answer,
+        generated_item_json: task.generated_item_json,
         answer_model: model.model_name,
         assistant,
         text,
@@ -728,12 +674,21 @@ impl Display for RequestError {
 impl std::error::Error for RequestError {}
 
 fn chat_request<'a>(model: &'a ModelConfig, prompt: &'a str, json_output: bool) -> ChatRequest<'a> {
+    let mut messages = Vec::with_capacity(2);
+    if let Some(system_prompt) = model.system_prompt.as_deref() {
+        messages.push(ChatMessage {
+            role: "system",
+            content: system_prompt,
+        });
+    }
+    messages.push(ChatMessage {
+        role: "user",
+        content: prompt,
+    });
+
     ChatRequest {
         model: &model.model_name,
-        messages: [ChatMessage {
-            role: "user",
-            content: prompt,
-        }],
+        messages,
         max_completion_tokens: model.max_completion_tokens,
         reasoning_effort: model.reasoning_effort.as_deref(),
         stream: model.stream && !json_output,
@@ -775,6 +730,12 @@ fn trim_model_config(model: &mut ModelConfig) {
     model.endpoint = model.endpoint.trim().to_owned();
     model.model_name = model.model_name.trim().to_owned();
     model.api_key = model.api_key.trim().to_owned();
+    if let Some(system_prompt) = &mut model.system_prompt {
+        *system_prompt = system_prompt.trim().to_owned();
+        if system_prompt.is_empty() {
+            model.system_prompt = None;
+        }
+    }
     if let Some(reasoning_effort) = &mut model.reasoning_effort {
         *reasoning_effort = reasoning_effort.trim().to_owned();
     }
@@ -856,36 +817,54 @@ fn load_samples(cfg: &Config) -> Result<Vec<SourceSample>> {
     Ok(out)
 }
 
-fn normalize_sample(_input: &InputConfig, _index: usize, value: Value) -> Result<SourceSample> {
-    let task_id = required_top_level_text(&value, "task_id")?;
-    let sample_index = required_top_level_text(&value, "sample_index")?;
-    let completions_id = required_top_level_text(&value, "completions_id")?;
-    let context = required_top_level_text(&value, "context")?;
-    let original_correct_answer =
-        normalize_answer_label(&required_top_level_text(&value, "ref_answer")?)
-            .ok_or_else(|| anyhow!("ref_answer must start with an option label"))?;
-    let source_user = parse_single_turn_context(&context).with_context(|| {
-        format!(
-            "invalid single-turn context for sample {}",
-            format!("{task_id}_{sample_index}_{completions_id}")
-        )
-    })?;
-    let source_mcq = parse_multiple_choice_question(&source_user).with_context(|| {
-        format!(
-            "source user is not a supported multiple-choice prompt for sample {}",
-            format!("{task_id}_{sample_index}_{completions_id}")
-        )
-    })?;
-    ensure!(
-        choice_text(&source_mcq.choices, &original_correct_answer).is_some(),
-        "ref_answer {} does not match any parsed choice",
-        original_correct_answer
-    );
+fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<SourceSample> {
+    let context = required_top_level_text(&value, "context")
+        .or_else(|_| required_top_level_text(&value, "text"))
+        .with_context(|| format!("sample_index={index} missing context/text"))?;
+
+    let source_user = parse_single_turn_context(&context)
+        .or_else(|_| {
+            Ok::<String, anyhow::Error>(normalize_context_text(&context).trim().to_owned())
+        })
+        .with_context(|| format!("failed to normalize sample at index {index}"))?;
+
+    ensure!(!source_user.is_empty(), "source user content is empty");
+
+    let sample_id = build_sample_id(index, &value);
+
+    let mut meta = serde_json::Map::new();
+    for key in [
+        "task_id",
+        "sample_index",
+        "completions_id",
+        "subject",
+        "ref_answer",
+        "source",
+        "dataset",
+    ] {
+        if let Some(v) = value.get(key) {
+            meta.insert(key.to_owned(), v.clone());
+        }
+    }
+
     Ok(SourceSample {
-        sample_id: format!("{task_id}_{sample_index}_{completions_id}"),
-        source_mcq,
-        original_correct_answer,
+        sample_id,
+        source_user,
+        source_meta: Value::Object(meta),
     })
+}
+
+fn build_sample_id(index: usize, value: &Value) -> String {
+    let task_id = top_level_text(value, "task_id");
+    let sample_index = top_level_text(value, "sample_index");
+    let completions_id = top_level_text(value, "completions_id");
+
+    match (task_id, sample_index, completions_id) {
+        (Some(a), Some(b), Some(c)) => format!("{a}_{b}_{c}"),
+        (Some(a), Some(b), None) => format!("{a}_{b}"),
+        (Some(a), None, None) => a,
+        _ => format!("sample_{index:06}"),
+    }
 }
 
 fn parse_single_turn_context(context: &str) -> Result<String> {
@@ -919,117 +898,6 @@ fn parse_single_turn_context(context: &str) -> Result<String> {
     let user = trimmed["User:".len()..assistant_start].trim();
     ensure!(!user.is_empty(), "context user content is empty");
     Ok(user.to_owned())
-}
-
-fn parse_multiple_choice_question(text: &str) -> Result<MultipleChoiceQuestion> {
-    let normalized = text.replace("\r\n", "\n");
-    let lines = normalized.lines().collect::<Vec<_>>();
-    let question_idx = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("Question:"))
-        .ok_or_else(|| anyhow!("missing Question: line"))?;
-    let choices_idx = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("Choices:"))
-        .ok_or_else(|| anyhow!("missing Choices: line"))?;
-    ensure!(
-        choices_idx > question_idx,
-        "Choices: must appear after Question:"
-    );
-
-    let preamble = lines[..question_idx].join("\n").trim().to_owned();
-
-    let mut question_lines = Vec::new();
-    let question_head = lines[question_idx].trim_start();
-    question_lines.push(
-        question_head
-            .strip_prefix("Question:")
-            .unwrap_or(question_head)
-            .trim(),
-    );
-    question_lines.extend(
-        lines[question_idx + 1..choices_idx]
-            .iter()
-            .map(|line| line.trim_end()),
-    );
-    let question = question_lines.join("\n").trim().to_owned();
-    ensure!(!question.is_empty(), "question stem is empty");
-
-    let mut choices = Vec::<Choice>::new();
-    for line in &lines[choices_idx + 1..] {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((label, text)) = parse_choice_line(trimmed) {
-            choices.push(Choice { label, text });
-            continue;
-        }
-        if let Some(last) = choices.last_mut() {
-            last.text.push(' ');
-            last.text.push_str(trimmed);
-            continue;
-        }
-        return Err(anyhow!(
-            "invalid choice line before any parsed choice: {:?}",
-            trimmed
-        ));
-    }
-
-    ensure!(choices.len() >= 2, "need at least two parsed choices");
-    let expected_labels = expected_labels(choices.len());
-    let actual_labels = choices
-        .iter()
-        .map(|choice| choice.label.clone())
-        .collect::<Vec<_>>();
-    ensure!(
-        actual_labels == expected_labels,
-        "choices must use sequential labels {:?}, got {:?}",
-        expected_labels,
-        actual_labels
-    );
-
-    Ok(MultipleChoiceQuestion {
-        preamble,
-        question,
-        choices,
-    })
-}
-
-fn parse_choice_line(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim();
-    let mut chars = trimmed.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_alphabetic() {
-        return None;
-    }
-    let label = first.to_ascii_uppercase().to_string();
-    let (delimiter_idx, delimiter) = chars.next()?;
-    if !matches!(delimiter, '.' | '．' | '、' | ':' | '：' | ')' | '）') {
-        return None;
-    }
-    let text = trimmed[delimiter_idx + delimiter.len_utf8()..].trim();
-    (!text.is_empty()).then_some((label, text.to_owned()))
-}
-
-fn normalize_answer_label(text: &str) -> Option<String> {
-    text.trim()
-        .chars()
-        .find(|ch| ch.is_ascii_alphabetic())
-        .map(|ch| ch.to_ascii_uppercase().to_string())
-}
-
-fn expected_labels(count: usize) -> Vec<String> {
-    (0..count)
-        .map(|index| ((b'A' + index as u8) as char).to_string())
-        .collect()
-}
-
-fn choice_text<'a>(choices: &'a [Choice], label: &str) -> Option<&'a str> {
-    choices
-        .iter()
-        .find(|choice| choice.label == label)
-        .map(|choice| choice.text.as_str())
 }
 
 fn normalize_context_text(text: &str) -> String {
@@ -1085,15 +953,20 @@ fn build_resume_plan(
 
     for sample in samples {
         let mut missing_indices = Vec::new();
+        let mut accepted_tasks = Vec::new();
         for index in 0..variant_count {
             let id = task_id(&sample.sample_id, index);
             match resume_rows.get(&id) {
-                Some(row) => match parse_row_status(row)? {
-                    RunStatus::Done => {}
-                    RunStatus::Generated => {
-                        pending_tasks.push(pending_task_from_output_row(row)?);
+                Some(row) => {
+                    let task = pending_task_from_output_row(row)?;
+                    accepted_tasks.push(task.clone());
+                    match parse_row_status(row)? {
+                        RunStatus::Done => {}
+                        RunStatus::Generated => {
+                            pending_tasks.push(task);
+                        }
                     }
-                },
+                }
                 None => missing_indices.push(index),
             }
         }
@@ -1101,6 +974,7 @@ fn build_resume_plan(
             generator_jobs.push(GenerateJob {
                 sample: sample.clone(),
                 missing_indices,
+                accepted_tasks,
             });
         }
     }
@@ -1110,124 +984,101 @@ fn build_resume_plan(
 
 fn build_generation_prompt(
     sample: &SourceSample,
-    total_target_count: usize,
+    count: usize,
     accepted: &[PendingTask],
     feedback: Option<&str>,
 ) -> Result<String> {
-    let original_correct_text =
-        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
-            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
-    let choice_count = sample.source_mcq.choices.len();
-    let original_labels = expected_labels(sample.source_mcq.choices.len()).join(", ");
-    let original_user = render_generated_user(
-        &sample.source_mcq.preamble,
-        &sample.source_mcq.question,
-        &sample.source_mcq.choices,
-    );
-
-    let feedback_block = feedback
-        .map(|text| {
-            format!(
-                "\n上一轮失败原因：{}\n请只修复这些问题，不要重复犯错。\n",
-                text
-            )
-        })
-        .unwrap_or_default();
     let accepted_block = if accepted.is_empty() {
         String::new()
     } else {
         format!(
-            "已接受题：{}\n",
-            serde_json::to_string(
+            "\n已接受样本（新生成内容不要与这些重复）：\n{}\n",
+            serde_json::to_string_pretty(
                 &accepted
                     .iter()
-                    .map(|task| {
-                        json!({
-                            "user": task.user,
-                            "answer": task.generated_correct_answer,
-                        })
-                    })
+                    .map(|task| json!({ "user": task.user }))
                     .collect::<Vec<_>>()
             )?
         )
     };
-    let diversity_block = if total_target_count > 1 {
-        let accepted_labels = accepted
-            .iter()
-            .map(|task| task.generated_correct_answer.as_str())
-            .collect::<Vec<_>>();
-        format!(
-            "\n本样本总共需要生成 {total_target_count} 道新题。当前已接受 {} 道，新题正确答案字母依次为 {:?}。最终整组结果至少要覆盖 2 种不同的正确答案字母。\n",
-            accepted.len(),
-            accepted_labels
-        )
-    } else {
-        String::new()
-    };
+    let feedback_block = feedback
+        .map(|text| {
+            format!("\n上一轮输出未通过，主要原因：\n{text}\n请仅修复这些问题后重新输出。\n")
+        })
+        .unwrap_or_default();
+
     Ok(format!(
-        "生成1道与原题相关但本质不同的新选择题。\n\
-先换掉原正确答案，再重写题干和4个选项，使 new_correct_answer 成为唯一正确答案。\n\
-返回纯JSON：{{\"questions\":[{{\"new_question\":\"...\",\"new_choices\":[\"A. ...\",\"B. ...\",\"C. ...\",\"D. ...\"],\"new_correct_answer\":\"A\"}}]}}\n\
-要求：同知识域和风格；不是同义改写；不再问原题同一个判断对象；至少改一个决定答案的判定点；new_correct_answer 不能等于原答案，新的正确选项内容也不能等于原答案内容；4个选项全部重写、同层级、不能复用原选项文本或仅换序；题面本身足以唯一判断；不要角色扮演；不要冷门特例；不要与已接受题重复。\n\
-自检：不是原题，不是表述改写，先换答案再重写，原答案未保留，只有一个合理答案。\n\
-原始样本：{}\n{}{}输出结构：{}\n{}",
-        serde_json::to_string_pretty(&json!({
-            "sample_id": sample.sample_id,
-            "original_user": original_user,
-            "preamble": sample.source_mcq.preamble,
-            "question": sample.source_mcq.question,
-            "choices": sample.source_mcq.choices,
-            "original_correct_answer": sample.original_correct_answer,
-            "original_correct_choice_text": original_correct_text,
-        }))?,
-        accepted_block,
-        diversity_block,
-        serde_json::to_string_pretty(&json!({
-            "question_count": 1,
-            "choice_count": choice_count,
-            "option_labels": original_labels,
-        }))?,
-        feedback_block
+        "你要基于给定的原始 user prompt，生成 {count} 条新的训练样本。\n\n\
+目标：\n\
+生成的新样本必须与原样本保持相同的任务类型、语言风格、难度层级和作答方式，但不能只是原句的同义改写、语序调整、浅层替换或局部扰动。\n\
+新样本应与原样本属于同一类任务，但在题目对象、输入材料、约束条件、测试重点、求解路径、适用场景或边界条件上，至少有一处本质变化。\n\n\
+硬性要求：\n\
+1. 输出的是新的 user prompt，不要输出 assistant answer，不要输出解析，不要解释思路。\n\
+2. 新样本必须自包含，不能依赖图片、文件、外部网页、历史对话、隐含上下文、未给出的背景事实或“见上文/见下图/联网查询”等信息。\n\
+3. 不能泄漏或复用原题答案、参考答案、判题结果、历史 assistant 回复、思维链或任何评测信息。\n\
+4. 若原样本是单轮任务，则新样本也必须保持为单轮任务。\n\
+5. 若原样本包含格式约束、答题方式约束、输入输出约束、代码补全范式、选项结构、函数签名、样例格式或“只输出答案”等要求，应尽量保留。\n\
+6. 若原样本属于以下类型之一，新样本必须保持同类任务，不得改成其他类型：\n\
+   - 知识问答\n\
+   - 数学题\n\
+   - 代码生成\n\
+   - 代码补全\n\
+   - 算法题\n\
+   - 翻译\n\
+   - 分类/判断\n\
+   - 多项选择题\n\
+7. 若原样本包含代码、伪代码、函数接口、输入输出描述、候选选项、样例或结构化约束，新样本应保留这种组织方式，但内容本身要实质变化。\n\
+8. 若新样本包含事实性内容，该内容必须满足以下之一：\n\
+   - 来自原样本中已给出的信息框架；\n\
+   - 不依赖具体外部事实也能自然成立；\n\
+   - 是常见、稳定、非冷门、无需检索即可回答的内容。\n\
+9. 不要为了“看起来不同”而引入冷门、偏门、拼凑感强、低频或不自然的设定。\n\
+10. 新样本应当自然、清晰、完整、可回答，并且足以支持高质量回答。\n\
+11. 若原样本本身存在噪声、冗余提示、错误推理、评测残留、无关元信息或低质量表达，新样本不要继承这些噪声，应只保留有效任务意图与必要风格特征。\n\
+12. 不要生成与原样本几乎等价的问题；不要只替换数字、实体名、变量名、地名、人名或语言表面形式。\n\n\
+多样性要求：\n\
+- 与原样本相比，优先改变以下至少一项：\n\
+  - 输入材料\n\
+  - 判断对象\n\
+  - 约束条件\n\
+  - 边界情况\n\
+  - 题面设定\n\
+  - 测试重点\n\
+  - 推理路径\n\
+  - 输出组织方式\n\
+- 但改变后仍要保持同类任务、同级难度、同类回答方式。\n\n\
+输出格式：\n\
+返回纯 JSON，不要输出额外文字。\n\
+{{\n\
+  \"items\": [\n\
+    {{\n\
+      \"user\": \"...\",\n\
+      \"meta\": {{}}\n\
+    }}\n\
+  ]\n\
+}}\n\n\
+其中：\n\
+- items 必须恰好包含 {count} 个对象\n\
+- 每个对象的 user 为新的 user prompt\n\
+- 每个对象的 meta 可为空对象\n\n\
+输出前自检：\n\
+- 这些新样本是否只是原样本改写？如果是，重写。\n\
+- 这些新样本是否泄漏了原答案、历史回复或评测信息？如果是，重写。\n\
+- 这些新样本是否需要外部信息才能回答？如果是，重写。\n\
+- 这些新样本是否改变了任务类型或答题方式？如果是，重写。\n\
+- 这些新样本是否遵循事实性原则？若包含事实性内容，是否来自原样本已给出的信息框架，或属于无需检索即可回答的常见稳定事实？如果不是，重写。\n\
+- 这些新样本是否自然、清晰、完整？如果不是，重写。\n\n\
+原始 user prompt：\n{}\n{}{}",
+        sample.source_user, accepted_block, feedback_block
     ))
 }
 
-fn parse_generated_questions(
+fn parse_generated_items(
     text: &str,
     expected: usize,
     sample: &SourceSample,
-) -> Result<Vec<GeneratedQuestionItem>> {
-    let envelope = parse_generated_questions_envelope(text)?;
-    ensure!(
-        envelope.questions.len() == expected,
-        "expected exactly {expected} generated questions, got {}",
-        envelope.questions.len()
-    );
-
-    let mut seen_rendered = Vec::<String>::new();
-    let mut out = Vec::with_capacity(envelope.questions.len());
-    for (index, draft) in envelope.questions.into_iter().enumerate() {
-        let validated = validate_generated_question(draft, sample)
-            .with_context(|| format!("generated question #{index} failed validation"))?;
-        let rendered = render_generated_user(
-            &sample.source_mcq.preamble,
-            &validated.question,
-            &validated.choices,
-        );
-        let normalized_rendered = normalize_compare_text(&rendered);
-        ensure!(
-            !seen_rendered
-                .iter()
-                .any(|existing| existing == &normalized_rendered),
-            "generated question #{index} is a duplicate of another generated question"
-        );
-        seen_rendered.push(normalized_rendered);
-        out.push(validated);
-    }
-    Ok(out)
-}
-
-fn parse_generated_questions_envelope(text: &str) -> Result<GeneratedQuestionsEnvelope> {
-    serde_json::from_str(text)
+) -> Result<Vec<GeneratedItem>> {
+    let envelope: GeneratedItemsEnvelope = serde_json::from_str(text)
         .or_else(|_| {
             extract_json_object_from_text(text)
                 .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no json object")))
@@ -1235,10 +1086,33 @@ fn parse_generated_questions_envelope(text: &str) -> Result<GeneratedQuestionsEn
         })
         .with_context(|| {
             format!(
-                "generator did not return valid JSON or an extractable JSON object: {:?}",
+                "generator did not return valid JSON or extractable JSON: {:?}",
                 preview_text(text, 200)
             )
-        })
+        })?;
+
+    ensure!(
+        envelope.items.len() == expected,
+        "expected exactly {expected} generated items, got {}",
+        envelope.items.len()
+    );
+
+    let mut seen = Vec::<String>::new();
+    let mut out = Vec::new();
+
+    for (index, draft) in envelope.items.into_iter().enumerate() {
+        let item = validate_generated_item(draft, sample)
+            .with_context(|| format!("generated item #{index} failed validation"))?;
+        let normalized = normalize_compare_text(&item.user);
+        ensure!(
+            !seen.iter().any(|x| x == &normalized),
+            "generated item #{index} duplicates another generated item"
+        );
+        seen.push(normalized);
+        out.push(item);
+    }
+
+    Ok(out)
 }
 
 fn extract_json_object_from_text(text: &str) -> Option<String> {
@@ -1297,176 +1171,38 @@ fn extract_first_balanced_json_object(text: &str) -> Option<String> {
     None
 }
 
-fn validate_generated_question(
-    mut draft: GeneratedQuestionDraft,
+fn validate_generated_item(
+    draft: GeneratedItemDraft,
     sample: &SourceSample,
-) -> Result<GeneratedQuestionItem> {
-    draft.new_question = draft.new_question.trim().to_owned();
-    draft.new_correct_answer = normalize_answer_label(&draft.new_correct_answer)
-        .ok_or_else(|| anyhow!("correct_answer must start with an option label"))?;
-
+) -> Result<GeneratedItem> {
+    let user = draft.user.trim().to_owned();
+    ensure!(!user.is_empty(), "generated user is empty");
     ensure!(
-        !draft.new_question.is_empty(),
-        "generated question stem is empty"
-    );
-    ensure!(
-        !draft.new_question.contains("Question:"),
-        "generated new_question must not contain a Question: prefix"
-    );
-    ensure!(
-        !draft.new_question.contains("Choices:"),
-        "generated new_question must not contain a Choices: block"
+        !user.starts_with("Assistant:"),
+        "generated item must be a user prompt, not an assistant response"
     );
 
-    let choices = draft
-        .new_choices
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let trimmed = line.trim();
-            let (label, text) = parse_choice_line(trimmed).ok_or_else(|| {
-                anyhow!(
-                    "generated new_choices[{}] must look like \"A. ...\", got {:?}",
-                    index,
-                    preview_text(trimmed, 80)
-                )
-            })?;
-            Ok(Choice { label, text })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut item = GeneratedQuestionItem {
-        question: draft.new_question,
-        choices,
-        correct_answer: draft.new_correct_answer,
-    };
+    let user_norm = normalize_compare_text(&user);
+    let original_norm = normalize_compare_text(&sample.source_user);
 
     ensure!(
-        item.choices.len() == sample.source_mcq.choices.len(),
-        "generated question must contain exactly {} choices, got {}",
-        sample.source_mcq.choices.len(),
-        item.choices.len()
+        user_norm != original_norm,
+        "generated item is effectively identical to the original"
     );
 
-    for choice in &mut item.choices {
-        choice.label = normalize_answer_label(&choice.label)
-            .ok_or_else(|| anyhow!("choice label must start with an option letter"))?;
-        choice.text = choice.text.trim().to_owned();
-        ensure!(
-            !choice.text.is_empty(),
-            "generated choice {} is empty",
-            choice.label
-        );
-    }
+    let item_json = serde_json::to_string(&GeneratedItemDraft {
+        user: user.clone(),
+        meta: draft.meta,
+    })?;
 
-    let expected_labels = expected_labels(item.choices.len());
-    let actual_labels = item
-        .choices
-        .iter()
-        .map(|choice| choice.label.clone())
-        .collect::<Vec<_>>();
-    ensure!(
-        actual_labels == expected_labels,
-        "generated choices must use sequential labels {:?}, got {:?}",
-        expected_labels,
-        actual_labels
-    );
-    ensure!(
-        item.correct_answer != sample.original_correct_answer,
-        "generated correct answer {} is unchanged from the original answer",
-        item.correct_answer
-    );
-
-    let generated_correct_text =
-        choice_text(&item.choices, &item.correct_answer).ok_or_else(|| {
-            anyhow!(
-                "generated correct answer {} is missing from choices",
-                item.correct_answer
-            )
-        })?;
-    let original_correct_text =
-        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
-            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
-    ensure!(
-        !texts_too_similar(generated_correct_text, original_correct_text),
-        "generated correct choice text is still too similar to the original correct answer"
-    );
-
-    let generated_question_norm = normalize_compare_text(&item.question);
-    let original_question_norm = normalize_compare_text(&sample.source_mcq.question);
-    let generated_choice_texts = item
-        .choices
-        .iter()
-        .map(|choice| normalize_compare_text(&choice.text))
-        .collect::<Vec<_>>();
-    let original_choice_texts = sample
-        .source_mcq
-        .choices
-        .iter()
-        .map(|choice| normalize_compare_text(&choice.text))
-        .collect::<Vec<_>>();
-    ensure!(
-        generated_question_norm != original_question_norm
-            || generated_choice_texts != original_choice_texts,
-        "generated question is effectively identical to the original question"
-    );
-    ensure!(
-        generated_choice_texts != original_choice_texts,
-        "generated options are identical to the original ordered options"
-    );
-    let mut generated_choice_texts_sorted = generated_choice_texts.clone();
-    generated_choice_texts_sorted.sort();
-    let mut original_choice_texts_sorted = original_choice_texts.clone();
-    original_choice_texts_sorted.sort();
-    ensure!(
-        generated_choice_texts_sorted != original_choice_texts_sorted,
-        "generated options are just the original options in a different order"
-    );
-
-    let reused_choice_count = item
-        .choices
-        .iter()
-        .filter(|choice| {
-            sample
-                .source_mcq
-                .choices
-                .iter()
-                .any(|original| texts_too_similar(&choice.text, &original.text))
-        })
-        .count();
-    ensure!(
-        reused_choice_count + 1 < item.choices.len(),
-        "generated options reuse too many original choices; they must be rewritten around the new decision point"
-    );
-
-    let has_duplicate_choice_text =
-        generated_choice_texts
-            .iter()
-            .enumerate()
-            .any(|(index, left)| {
-                generated_choice_texts
-                    .iter()
-                    .skip(index + 1)
-                    .any(|right| left == right)
-            });
-    ensure!(
-        !has_duplicate_choice_text,
-        "generated options contain duplicated choice text"
-    );
-
-    ensure!(
-        !contains_ambiguous_negative_stem(&item.question),
-        "generated question uses an ambiguous negative/exception stem; rewrite it as a positive, uniquely answerable question"
-    );
-
-    Ok(item)
+    Ok(GeneratedItem { user, item_json })
 }
 
-async fn validate_generated_questions_with_model(
+async fn validate_generated_items_with_model(
     client: &OpenAiClient,
     model: &ModelConfig,
     sample: &SourceSample,
-    generated: &[GeneratedQuestionItem],
+    generated: &[GeneratedItemDraft],
 ) -> Result<()> {
     let prompt = build_generation_validation_prompt(sample, generated)?;
     let result = client
@@ -1490,7 +1226,7 @@ async fn validate_generated_questions_with_model(
         .collect::<Vec<_>>();
     ensure!(
         invalid_reasons.is_empty(),
-        "model validation rejected generated questions: {}",
+        "model validation rejected generated items: {}",
         invalid_reasons.join(" | ")
     );
     Ok(())
@@ -1498,34 +1234,26 @@ async fn validate_generated_questions_with_model(
 
 fn build_generation_validation_prompt(
     sample: &SourceSample,
-    generated: &[GeneratedQuestionItem],
+    generated: &[GeneratedItemDraft],
 ) -> Result<String> {
-    let original_correct_text =
-        choice_text(&sample.source_mcq.choices, &sample.original_correct_answer)
-            .ok_or_else(|| anyhow!("original correct answer is missing from parsed choices"))?;
     Ok(format!(
-        "你是选择题变体质检器。\n\
+        "你是训练样本质检器。\n\
 返回纯 JSON：{{\"items\":[{{\"index\":0,\"valid\":true,\"reason\":\"...\"}}]}}\n\
-items 长度必须与候选题数量一致，每项只能有 index、valid、reason。\n\n\
+items 长度必须与候选样本数量一致，每项只能有 index、valid、reason。\n\n\
 只有同时满足以下条件时才判 valid=true：\n\
-1. 保持同一知识域、题型风格、语言风格，表面形式尽量接近原题。\n\
-2. 不是同义改写；如果仍在问原题同一个判断对象，则不通过。\n\
-3. 候选题是先换掉原正确答案，再围绕新答案重写的；不是在原题上只做表面改写。\n\
-4. 至少改动了一个真正决定答案的判定点，例如比较对象、适用条件、规则对象、制度目的、适用范围、概念边界、例外条件、排序依据。\n\
-5. 新正确答案是因为判定依据变化而改变，不是只换字母，也不是原答案内容的近义改写。\n\
-6. 选项围绕新判定点重写，不是原选项复用或换序，且四个选项处于同一概念层级。\n\
-7. 不需要外部检索；题面本身足以支持唯一答案。\n\
-8. 没有退化成特别偏、特别窄或特别冷门的低质量特例题。\n\
-9. declared correct_answer 确实是唯一最佳答案。\n\n\
-不通过时，reason 只写最关键的失败原因，例如：仍是原问题 / 表述改写 / 未先换答案 / 答案未变 / 需要外部检索 / 选项层级不一致 / 题目有歧义。\n\n\
+1. 与原样本保持同一知识域、任务风格和语言风格。\n\
+2. 不是简单同义改写或表面改写。\n\
+3. 新样本与原样本相关但本质不同。\n\
+4. 新样本是自包含的，不依赖外部检索、图片、历史上下文或隐藏前提。\n\
+5. 新样本本身是一个 user prompt，而不是 assistant answer。\n\
+6. 候选样本本身清晰、自然，不是低质量、冷门或明显拼凑的特例。\n\n\
+不通过时，reason 只写最关键的失败原因，例如：表述改写 / 与原任务本质相同 / 需要外部知识 / 不是 user prompt / 低质量拼接。\n\n\
 原始样本：\n{}\n\n\
-候选题：\n{}\n",
+候选样本：\n{}\n",
         serde_json::to_string_pretty(&json!({
             "sample_id": sample.sample_id,
-            "question": sample.source_mcq.question,
-            "choices": sample.source_mcq.choices,
-            "original_correct_answer": sample.original_correct_answer,
-            "original_correct_choice_text": original_correct_text,
+            "user": sample.source_user,
+            "meta": sample.source_meta,
         }))?,
         serde_json::to_string_pretty(
             &generated
@@ -1534,80 +1262,13 @@ items 长度必须与候选题数量一致，每项只能有 index、valid、rea
                 .map(|(index, item)| {
                     json!({
                         "index": index,
-                        "question": item.question,
-                        "choices": item.choices,
-                        "correct_answer": item.correct_answer,
+                        "user": item.user,
+                        "meta": item.meta,
                     })
                 })
                 .collect::<Vec<_>>()
         )?
     ))
-}
-
-fn render_generated_user(preamble: &str, question: &str, choices: &[Choice]) -> String {
-    let mut lines = Vec::<String>::new();
-    let sanitized_preamble = sanitize_preamble(preamble);
-    if !sanitized_preamble.is_empty() {
-        lines.push(sanitized_preamble);
-    }
-
-    let mut question_lines = question.trim().lines();
-    if let Some(first) = question_lines.next() {
-        lines.push(format!("Question: {}", first.trim()));
-    }
-    lines.extend(question_lines.map(|line| line.trim_end().to_owned()));
-    lines.push("Choices:".to_owned());
-    lines.extend(
-        choices
-            .iter()
-            .map(|choice| format!("{}. {}", choice.label, choice.text.trim())),
-    );
-    lines.join("\n")
-}
-
-fn sanitize_preamble(preamble: &str) -> String {
-    preamble
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !looks_like_roleplay_line(line))
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn looks_like_roleplay_line(line: &str) -> bool {
-    let normalized = line.trim().to_ascii_lowercase();
-    (normalized.starts_with("you are ")
-        || normalized.starts_with("you are a ")
-        || normalized.starts_with("you are an "))
-        && (normalized.contains("expert")
-            || normalized.contains("assistant")
-            || normalized.contains("teacher")
-            || normalized.contains("tutor")
-            || normalized.contains("talented"))
-        || ((line.contains("你是") || line.contains("请你作为"))
-            && (line.contains("专家")
-                || line.contains("老师")
-                || line.contains("助手")
-                || line.contains("顾问")
-                || line.contains("学者")))
-}
-
-fn contains_ambiguous_negative_stem(question: &str) -> bool {
-    [
-        "最不适合",
-        "最不是",
-        "最不能",
-        "最不可能",
-        "最不恰当",
-        "最不属于",
-        "最不正确",
-        "错误的是",
-        "不正确的是",
-    ]
-    .iter()
-    .any(|pattern| question.contains(pattern))
 }
 
 fn normalize_compare_text(text: &str) -> String {
@@ -1635,20 +1296,6 @@ fn normalize_compare_text(text: &str) -> String {
         })
         .flat_map(|ch| ch.to_lowercase())
         .collect()
-}
-
-fn texts_too_similar(left: &str, right: &str) -> bool {
-    let left = normalize_compare_text(left);
-    let right = normalize_compare_text(right);
-    if left == right {
-        return true;
-    }
-    let (shorter, longer) = if left.len() <= right.len() {
-        (&left, &right)
-    } else {
-        (&right, &left)
-    };
-    !shorter.is_empty() && longer.contains(shorter) && shorter.len() * 5 >= longer.len() * 4
 }
 
 fn parse_chat_result(body: &str) -> Result<ChatResult> {
@@ -1743,10 +1390,10 @@ fn append_chunk_text(value: &Value, key: &str, out: &mut String) {
     }
 }
 
-fn merge_assistant(reasoning: Option<String>, content: String) -> String {
+fn merge_answer_output(reasoning: Option<String>, content: String) -> String {
     match (reasoning.map(|text| text.trim().to_owned()), content.trim()) {
-        (Some(reasoning), "") => format!("<think>\n{reasoning}\n</think>"),
-        (Some(reasoning), content) => format!("<think>\n{reasoning}\n</think>\n\n{content}"),
+        (Some(reasoning), "") => reasoning,
+        (Some(reasoning), content) => format!("{reasoning}\n\n{content}"),
         (None, content) => content.to_owned(),
     }
 }
@@ -1760,7 +1407,7 @@ fn generated_output_row(task: &PendingTask) -> OutputRow {
         task_id: task.task_id.clone(),
         status: RunStatus::Generated.as_str().to_owned(),
         user: task.user.clone(),
-        generated_correct_answer: task.generated_correct_answer.clone(),
+        generated_item_json: task.generated_item_json.clone(),
         answer_model: String::new(),
         assistant: String::new(),
         text: String::new(),
@@ -1855,12 +1502,38 @@ fn append_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
     Ok(())
 }
 
-fn prepare_output(cfg: &Config) -> Result<()> {
-    if let Some(parent) = cfg.output.jsonl_path.parent() {
+fn build_output_paths(output: &OutputConfig) -> Result<OutputPaths> {
+    let legacy_jsonl_path = output.jsonl_path.clone();
+    let base_dir = output
+        .jsonl_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("data"));
+    let file_name = output
+        .jsonl_path
+        .file_name()
+        .ok_or_else(|| anyhow!("output.jsonl_path must include a file name"))?;
+
+    Ok(OutputPaths {
+        legacy_jsonl_path,
+        generate_jsonl_path: base_dir.join("generate").join(file_name),
+        done_jsonl_path: base_dir.join("done").join(file_name),
+    })
+}
+
+fn prepare_output(paths: &OutputPaths, resume: bool) -> Result<()> {
+    for parent in [
+        paths.generate_jsonl_path.parent(),
+        paths.done_jsonl_path.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         fs::create_dir_all(parent)?;
     }
-    if !cfg.run.resume {
-        File::create(&cfg.output.jsonl_path)?;
+    if !resume {
+        File::create(&paths.generate_jsonl_path)?;
+        File::create(&paths.done_jsonl_path)?;
     }
     Ok(())
 }
@@ -1873,11 +1546,20 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn load_resume_rows(path: &Path) -> Result<HashMap<String, OutputRow>> {
-    Ok(read_jsonl_if_exists::<OutputRow>(path, "output")?
-        .into_iter()
-        .map(|row| (row.task_id.clone(), row))
-        .collect())
+fn load_resume_rows(paths: &OutputPaths) -> Result<HashMap<String, OutputRow>> {
+    let mut rows = HashMap::new();
+
+    for (path, label) in [
+        (&paths.legacy_jsonl_path, "legacy output"),
+        (&paths.generate_jsonl_path, "generated output"),
+        (&paths.done_jsonl_path, "done output"),
+    ] {
+        for row in read_jsonl_if_exists::<OutputRow>(path, label)? {
+            rows.insert(row.task_id.clone(), row);
+        }
+    }
+
+    Ok(rows)
 }
 
 fn summarize_resume_rows(rows: &HashMap<String, OutputRow>) -> Result<(usize, usize)> {
@@ -1900,7 +1582,7 @@ fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
     Ok(PendingTask {
         task_id: row.task_id.clone(),
         user: user.to_owned(),
-        generated_correct_answer: row.generated_correct_answer.trim().to_owned(),
+        generated_item_json: row.generated_item_json.trim().to_owned(),
     })
 }
 

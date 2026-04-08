@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -12,7 +14,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, Response, StatusCode};
 use rustc_hash::FxHasher;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeOwned, DeserializeSeed, SeqAccess, Visitor},
+};
 use serde_json::{Value, json};
 use serde_jsonlines::{append_json_lines, json_lines};
 
@@ -79,6 +84,8 @@ struct GeneratorConfig {
     validate_generated_questions: bool,
     #[serde(default = "default_generator_json_object_response")]
     json_object_response: bool,
+    #[serde(default = "default_validator_json_object_response")]
+    validator_json_object_response: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -110,9 +117,9 @@ struct OutputConfig {
 
 #[derive(Clone)]
 struct OutputPaths {
-    legacy_jsonl_path: PathBuf,
     generate_jsonl_path: PathBuf,
-    done_jsonl_path: PathBuf,
+    done_success_jsonl_path: PathBuf,
+    done_failed_jsonl_path: PathBuf,
 }
 
 #[derive(Clone, Deserialize)]
@@ -172,12 +179,6 @@ struct OutputRow {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     generated_item_json: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    expected_answer: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    predicted_answer: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    answer_correct: Option<bool>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     answer_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     assistant: String,
@@ -195,7 +196,6 @@ struct GeneratedItemsEnvelope {
 #[serde(deny_unknown_fields)]
 struct GeneratedItemDraft {
     user: String,
-    #[serde(default)]
     answer: String,
     #[serde(default)]
     meta: Value,
@@ -206,6 +206,46 @@ struct GeneratedItem {
     user: String,
     answer: String,
     item_json: String,
+}
+
+#[derive(Clone)]
+struct PromptTemplates {
+    profile_name: String,
+    generation: String,
+    validation: Option<String>,
+}
+
+#[derive(Clone)]
+struct GeneratedTaskWriter {
+    generate_jsonl_path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct AnswerBatchStats {
+    success: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+struct AnsweredTask {
+    row: OutputRow,
+    correct: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptProfileFile {
+    name: String,
+    generation: PromptTemplateSection,
+    #[serde(default)]
+    validation: Option<PromptTemplateSection>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptTemplateSection {
+    template: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +351,7 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
         cfg.input.limit = Some(limit);
     }
     validate_config(&cfg)?;
+    let prompt_templates = load_prompt_templates(cfg.generator.validate_generated_questions)?;
 
     let samples = load_samples(&cfg)?;
     if samples.is_empty() {
@@ -320,6 +361,7 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
 
     let output_paths = build_output_paths(&cfg.output)?;
     prepare_output(&output_paths, cfg.run.resume)?;
+    let generated_task_writer = GeneratedTaskWriter::new(&output_paths);
     let resume_rows = if cfg.run.resume {
         load_resume_rows(&output_paths)?
     } else {
@@ -328,20 +370,44 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
     if !resume_rows.is_empty() {
         let (generated, done) = summarize_resume_rows(&resume_rows)?;
         eprintln!(
-            "resuming with {} tracked tasks from {} and {} (generated={}, done={})",
+            "resuming with {} tracked tasks from {}, {}, {} (generated={}, done={})",
             resume_rows.len(),
             output_paths.generate_jsonl_path.display(),
-            output_paths.done_jsonl_path.display(),
+            output_paths.done_success_jsonl_path.display(),
+            output_paths.done_failed_jsonl_path.display(),
             generated,
             done
         );
     }
 
-    let (generator_jobs, mut pending_tasks) =
+    let (generator_jobs, resumed_pending_tasks) =
         build_resume_plan(&samples, cfg.generator.variant_count, &resume_rows)?;
+    let answer_clients = cfg
+        .answer_models
+        .iter()
+        .map(|model| OpenAiClient::new(model, &cfg.run))
+        .collect::<Result<Vec<_>>>()?;
+    let answer_models = cfg.answer_models.clone();
     let mut generated_now = 0usize;
-    let resumed_generated = pending_tasks.len();
+    let resumed_generated = resumed_pending_tasks.len();
     let mut skipped_generate = 0usize;
+    let mut answered_success = 0usize;
+    let mut answered_failed = 0usize;
+    let mut skipped_answer = 0usize;
+
+    if !resumed_pending_tasks.is_empty() {
+        let stats = answer_tasks_and_persist(
+            answer_clients.clone(),
+            answer_models.clone(),
+            resumed_pending_tasks,
+            &output_paths,
+            cfg.concurrency.answer_requests,
+        )
+        .await?;
+        answered_success += stats.success;
+        answered_failed += stats.failed;
+        skipped_answer += stats.skipped;
+    }
 
     if !generator_jobs.is_empty() {
         let client = OpenAiClient::new(&cfg.generator.model, &cfg.run)?;
@@ -353,19 +419,36 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
             .map(|job| {
                 let client = client.clone();
                 let generator = generator.clone();
-                async move { generate_tasks(client, generator, job).await }
+                let prompt_templates = prompt_templates.clone();
+                let generated_task_writer = generated_task_writer.clone();
+                async move {
+                    generate_tasks(
+                        client,
+                        generator,
+                        prompt_templates,
+                        generated_task_writer,
+                        job,
+                    )
+                    .await
+                }
             })
             .buffer_unordered(concurrency);
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(tasks) => {
-                    let generated_rows = tasks.iter().map(generated_output_row).collect::<Vec<_>>();
-                    append_jsonl(&output_paths.generate_jsonl_path, &generated_rows)?;
                     generated_now += tasks.len();
-                    for task in tasks {
-                        pending_tasks.push(task);
-                    }
+                    let stats = answer_tasks_and_persist(
+                        answer_clients.clone(),
+                        answer_models.clone(),
+                        tasks,
+                        &output_paths,
+                        cfg.concurrency.answer_requests,
+                    )
+                    .await?;
+                    answered_success += stats.success;
+                    answered_failed += stats.failed;
+                    skipped_answer += stats.skipped;
                 }
                 Err(err) => {
                     skipped_generate += 1;
@@ -377,58 +460,14 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
         pb.finish_with_message("generate done");
     }
 
-    if pending_tasks.is_empty() {
-        println!(
-            "samples={} total_tasks={} new_tasks=0",
-            samples.len(),
-            samples.len() * cfg.generator.variant_count
-        );
-        return Ok(());
-    }
-
-    let answer_clients = cfg
-        .answer_models
-        .iter()
-        .map(|model| OpenAiClient::new(model, &cfg.run))
-        .collect::<Result<Vec<_>>>()?;
-    let answer_models = cfg.answer_models.clone();
-    let answer_total = pending_tasks.len();
-    let answer_pb = progress_bar(answer_total, "answer");
-    let concurrency = concurrency_limit(cfg.concurrency.answer_requests, answer_total);
-    let mut written = 0usize;
-    let mut skipped_answer = 0usize;
-
-    let mut stream = stream::iter(pending_tasks)
-        .map(|task| {
-            let idx = pick_model_index(&task.task_id, answer_models.len());
-            let client = answer_clients[idx].clone();
-            let model = answer_models[idx].clone();
-            async move { answer_task(client, model, task).await }
-        })
-        .buffer_unordered(concurrency);
-
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(row) => {
-                append_jsonl(&output_paths.done_jsonl_path, std::slice::from_ref(&row))?;
-                written += 1;
-            }
-            Err(err) => {
-                skipped_answer += 1;
-                eprintln!("skipped answer task: {err:#}");
-            }
-        }
-        answer_pb.inc(1);
-    }
-    answer_pb.finish_with_message("answer done");
-
     println!(
-        "samples={} total_tasks={} resumed_generated={} generated_now={} answered_now={} skipped_generate={} skipped_answer={}",
+        "samples={} total_tasks={} resumed_generated={} generated_now={} answered_success={} answered_failed={} skipped_generate={} skipped_answer={}",
         samples.len(),
         samples.len() * cfg.generator.variant_count,
         resumed_generated,
         generated_now,
-        written,
+        answered_success,
+        answered_failed,
         skipped_generate,
         skipped_answer
     );
@@ -438,6 +477,8 @@ async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> {
 async fn generate_tasks(
     client: OpenAiClient,
     generator: GeneratorConfig,
+    prompt_templates: PromptTemplates,
+    generated_task_writer: GeneratedTaskWriter,
     job: GenerateJob,
 ) -> Result<Vec<PendingTask>> {
     let expected = job.missing_indices.len();
@@ -450,6 +491,7 @@ async fn generate_tasks(
 
     for attempt in 0..generator.generation_attempts {
         let prompt = build_generation_prompt(
+            &prompt_templates,
             &job.sample,
             expected,
             &job.accepted_tasks,
@@ -496,9 +538,15 @@ async fn generate_tasks(
                 .iter()
                 .map(|item| serde_json::from_str::<GeneratedItemDraft>(&item.item_json))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            if let Err(err) =
-                validate_generated_items_with_model(&client, &generator.model, &job.sample, &drafts)
-                    .await
+            if let Err(err) = validate_generated_items_with_model(
+                &client,
+                &generator.model,
+                generator.validator_json_object_response,
+                &prompt_templates,
+                &job.sample,
+                &drafts,
+            )
+            .await
             {
                 if attempt + 1 < generator.generation_attempts {
                     feedback = Some(err.to_string());
@@ -514,10 +562,12 @@ async fn generate_tasks(
             .map(|(item, index)| PendingTask {
                 task_id: task_id(&job.sample.sample_id, *index),
                 user: item.user,
+                expected_answer: item.answer,
                 generated_item_json: item.item_json,
             })
             .collect::<Vec<_>>();
 
+        generated_task_writer.append_generated_tasks(&tasks)?;
         return Ok(tasks);
     }
 
@@ -532,33 +582,98 @@ async fn answer_task(
     client: OpenAiClient,
     model: ModelConfig,
     task: PendingTask,
-) -> Result<OutputRow> {
+) -> Result<AnsweredTask> {
+    let answer_prompt = build_answer_prompt(&task.user);
     let result = client
-        .chat(&model, &task.user, false)
+        .chat(&model, &answer_prompt, false)
         .await
         .with_context(|| format!("answer failed for task {}", task.task_id))?;
+
     let assistant = merge_answer_output(result.reasoning, result.content);
+
     ensure!(
         !assistant.trim().is_empty(),
         "answer model returned empty output for task {}",
         task.task_id
     );
-    let text = rwkv_text(&task.user, &assistant);
-    Ok(OutputRow {
-        task_id: task.task_id,
-        status: RunStatus::Done.as_str().to_owned(),
-        user: task.user,
-        generated_item_json: task.generated_item_json,
-        answer_model: model.model_name,
-        assistant,
-        text,
+
+    // 用完整 assistant 做答案抽取与判对
+    let predicted_answer =
+        extract_predicted_answer(&task.expected_answer, &assistant, &assistant);
+    let answer_correct =
+        compare_expected_and_predicted(&task.expected_answer, &predicted_answer);
+
+    // success 的训练文本写完整 assistant，而不是标准答案字母
+    let text = if answer_correct {
+        rwkv_text(&task.user, &assistant)
+    } else {
+        String::new()
+    };
+
+    Ok(AnsweredTask {
+        row: OutputRow {
+            task_id: task.task_id,
+            status: RunStatus::Done.as_str().to_owned(),
+
+            // 这些别清空，保留下来方便排查和后处理
+            user: task.user.clone(),
+            generated_item_json: task.generated_item_json.clone(),
+            answer_model: model.model_name.clone(),
+            assistant: assistant.clone(),
+            text,
+        },
+        correct: answer_correct,
     })
+}
+
+async fn answer_tasks_and_persist(
+    answer_clients: Vec<OpenAiClient>,
+    answer_models: Vec<ModelConfig>,
+    tasks: Vec<PendingTask>,
+    output_paths: &OutputPaths,
+    configured_concurrency: usize,
+) -> Result<AnswerBatchStats> {
+    if tasks.is_empty() {
+        return Ok(AnswerBatchStats::default());
+    }
+
+    let concurrency = concurrency_limit(configured_concurrency, tasks.len());
+    let mut stats = AnswerBatchStats::default();
+    let mut stream = stream::iter(tasks)
+        .map(|task| {
+            let idx = pick_model_index(&task.task_id, answer_models.len());
+            let client = answer_clients[idx].clone();
+            let model = answer_models[idx].clone();
+            async move { answer_task(client, model, task).await }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(answered) => {
+                let path = done_output_path(output_paths, answered.correct);
+                append_jsonl(path, std::slice::from_ref(&answered.row))?;
+                if answered.correct {
+                    stats.success += 1;
+                } else {
+                    stats.failed += 1;
+                }
+            }
+            Err(err) => {
+                stats.skipped += 1;
+                eprintln!("skipped answer task: {err:#}");
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 impl OpenAiClient {
     fn new(model: &ModelConfig, run: &RunConfig) -> Result<Self> {
-        let mut builder =
-            Client::builder().timeout(Duration::from_secs_f64(run.request_timeout_seconds));
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs_f64(run.request_timeout_seconds))
+            .user_agent("curl/8.5.0");
         if run.disable_env_proxy {
             builder = builder.no_proxy();
         }
@@ -635,6 +750,27 @@ impl OpenAiClient {
             .send()
             .await
             .map_err(RequestError::http)
+    }
+}
+
+impl GeneratedTaskWriter {
+    fn new(paths: &OutputPaths) -> Self {
+        Self {
+            generate_jsonl_path: paths.generate_jsonl_path.clone(),
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn append_generated_tasks(&self, tasks: &[PendingTask]) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let rows = tasks.iter().map(generated_output_row).collect::<Vec<_>>();
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| anyhow!("generated task writer lock poisoned"))?;
+        append_jsonl(&self.generate_jsonl_path, &rows)
     }
 }
 
@@ -762,6 +898,38 @@ fn validate_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+fn load_prompt_templates(validate_generated_questions: bool) -> Result<PromptTemplates> {
+    let profile: PromptProfileFile =
+        toml::from_str(include_str!("../prompts/multiple_choice.toml"))
+            .context("failed to parse built-in prompt profile TOML prompts/multiple_choice.toml")?;
+    ensure!(
+        !profile.name.trim().is_empty(),
+        "built-in prompt profile name must not be empty"
+    );
+    ensure!(
+        !profile.generation.template.trim().is_empty(),
+        "built-in prompt profile generation.template must not be empty"
+    );
+    if validate_generated_questions {
+        let validation = profile.validation.as_ref().ok_or_else(|| {
+            anyhow!("built-in prompt profile is missing [validation] while generator.validate_generated_questions=true")
+        })?;
+        ensure!(
+            !validation.template.trim().is_empty(),
+            "built-in prompt profile validation.template must not be empty"
+        );
+    }
+
+    Ok(PromptTemplates {
+        profile_name: profile.name.trim().to_owned(),
+        generation: profile.generation.template.trim().to_owned(),
+        validation: profile
+            .validation
+            .map(|section| section.template.trim().to_owned())
+            .filter(|text| !text.is_empty()),
+    })
+}
+
 fn validate_model(model: &ModelConfig) -> Result<()> {
     ensure!(
         !model.endpoint.trim().is_empty(),
@@ -822,11 +990,10 @@ fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<
         .or_else(|_| required_top_level_text(&value, "text"))
         .with_context(|| format!("sample_index={index} missing context/text"))?;
 
-    let source_user = parse_single_turn_context(&context)
-        .or_else(|_| {
-            Ok::<String, anyhow::Error>(normalize_context_text(&context).trim().to_owned())
-        })
-        .with_context(|| format!("failed to normalize sample at index {index}"))?;
+    let source_user = sanitize_training_user_prompt(
+        &extract_source_user(&context)
+            .with_context(|| format!("failed to normalize sample at index {index}"))?,
+    );
 
     ensure!(!source_user.is_empty(), "source user content is empty");
 
@@ -836,9 +1003,13 @@ fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<
     for key in [
         "task_id",
         "sample_index",
+        "repeat_index",
+        "pass_index",
         "completions_id",
+        "answer",
         "subject",
         "ref_answer",
+        "fail_reason",
         "source",
         "dataset",
     ] {
@@ -857,14 +1028,95 @@ fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<
 fn build_sample_id(index: usize, value: &Value) -> String {
     let task_id = top_level_text(value, "task_id");
     let sample_index = top_level_text(value, "sample_index");
+    let repeat_index = top_level_text(value, "repeat_index");
+    let pass_index = top_level_text(value, "pass_index");
     let completions_id = top_level_text(value, "completions_id");
 
-    match (task_id, sample_index, completions_id) {
-        (Some(a), Some(b), Some(c)) => format!("{a}_{b}_{c}"),
-        (Some(a), Some(b), None) => format!("{a}_{b}"),
-        (Some(a), None, None) => a,
+    match (
+        task_id,
+        sample_index,
+        repeat_index,
+        pass_index,
+        completions_id,
+    ) {
+        (Some(a), Some(b), _, _, Some(c)) => format!("{a}_{b}_{c}"),
+        (Some(a), Some(b), _, _, None) => format!("{a}_{b}"),
+        (Some(a), None, _, _, None) => a,
+        (None, Some(a), Some(b), Some(c), _) => format!("{a}_{b}_{c}"),
+        (None, Some(a), Some(b), None, _) => format!("{a}_{b}"),
+        (None, Some(a), None, Some(c), _) => format!("{a}_{c}"),
+        (None, Some(a), None, None, _) => format!("sample_{a}"),
         _ => format!("sample_{index:06}"),
     }
+}
+
+fn extract_source_user(context: &str) -> Result<String> {
+    parse_single_turn_context(context)
+        .or_else(|_| extract_source_user_from_structured_context(context))
+        .or_else(|_| {
+            let normalized = normalize_context_text(context);
+            let trimmed = normalized.trim();
+            ensure!(!trimmed.is_empty(), "context is empty");
+            Ok(trimmed.to_owned())
+        })
+}
+
+fn sanitize_training_user_prompt(text: &str) -> String {
+    let mut cleaned = text.trim().to_owned();
+
+    loop {
+        let Some(rest) = cleaned.strip_prefix("You are a very talented expert in ") else {
+            break;
+        };
+        let Some(period_index) = rest.find('.') else {
+            break;
+        };
+        cleaned = rest[period_index + 1..].trim_start().to_owned();
+    }
+
+    cleaned.trim().to_owned()
+}
+
+fn extract_source_user_from_structured_context(context: &str) -> Result<String> {
+    let normalized = normalize_context_text(context);
+    let payload: Value = serde_json::from_str(normalized.trim())
+        .context("context is not parseable structured JSON")?;
+
+    if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
+        return extract_source_user_from_prompt(prompt);
+    }
+
+    if let Some(stages) = payload.get("stages").and_then(Value::as_array) {
+        for stage in stages {
+            if let Some(prompt) = stage.get("prompt").and_then(Value::as_str) {
+                if let Ok(user) = extract_source_user_from_prompt(prompt) {
+                    return Ok(user);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "structured context JSON is missing a usable prompt"
+    ))
+}
+
+fn extract_source_user_from_prompt(prompt: &str) -> Result<String> {
+    parse_single_turn_context(prompt).or_else(|_| {
+        let normalized = normalize_context_text(prompt);
+        let trimmed = normalized.trim();
+        let prompt_body = trimmed
+            .strip_prefix("User:")
+            .map(str::trim)
+            .ok_or_else(|| anyhow!("prompt does not start with User:"))?;
+        let user = prompt_body
+            .split_once("\nAssistant:")
+            .map(|(user, _)| user)
+            .unwrap_or(prompt_body)
+            .trim();
+        ensure!(!user.is_empty(), "prompt user content is empty");
+        Ok(user.to_owned())
+    })
 }
 
 fn parse_single_turn_context(context: &str) -> Result<String> {
@@ -983,6 +1235,7 @@ fn build_resume_plan(
 }
 
 fn build_generation_prompt(
+    prompt_templates: &PromptTemplates,
     sample: &SourceSample,
     count: usize,
     accepted: &[PendingTask],
@@ -1007,69 +1260,29 @@ fn build_generation_prompt(
         })
         .unwrap_or_default();
 
-    Ok(format!(
-        "你要基于给定的原始 user prompt，生成 {count} 条新的训练样本。\n\n\
-目标：\n\
-生成的新样本必须与原样本保持相同的任务类型、语言风格、难度层级和作答方式，但不能只是原句的同义改写、语序调整、浅层替换或局部扰动。\n\
-新样本应与原样本属于同一类任务，但在题目对象、输入材料、约束条件、测试重点、求解路径、适用场景或边界条件上，至少有一处本质变化。\n\n\
-硬性要求：\n\
-1. 输出的是新的 user prompt，不要输出 assistant answer，不要输出解析，不要解释思路。\n\
-2. 新样本必须自包含，不能依赖图片、文件、外部网页、历史对话、隐含上下文、未给出的背景事实或“见上文/见下图/联网查询”等信息。\n\
-3. 不能泄漏或复用原题答案、参考答案、判题结果、历史 assistant 回复、思维链或任何评测信息。\n\
-4. 若原样本是单轮任务，则新样本也必须保持为单轮任务。\n\
-5. 若原样本包含格式约束、答题方式约束、输入输出约束、代码补全范式、选项结构、函数签名、样例格式或“只输出答案”等要求，应尽量保留。\n\
-6. 若原样本属于以下类型之一，新样本必须保持同类任务，不得改成其他类型：\n\
-   - 知识问答\n\
-   - 数学题\n\
-   - 代码生成\n\
-   - 代码补全\n\
-   - 算法题\n\
-   - 翻译\n\
-   - 分类/判断\n\
-   - 多项选择题\n\
-7. 若原样本包含代码、伪代码、函数接口、输入输出描述、候选选项、样例或结构化约束，新样本应保留这种组织方式，但内容本身要实质变化。\n\
-8. 若新样本包含事实性内容，该内容必须满足以下之一：\n\
-   - 来自原样本中已给出的信息框架；\n\
-   - 不依赖具体外部事实也能自然成立；\n\
-   - 是常见、稳定、非冷门、无需检索即可回答的内容。\n\
-9. 不要为了“看起来不同”而引入冷门、偏门、拼凑感强、低频或不自然的设定。\n\
-10. 新样本应当自然、清晰、完整、可回答，并且足以支持高质量回答。\n\
-11. 若原样本本身存在噪声、冗余提示、错误推理、评测残留、无关元信息或低质量表达，新样本不要继承这些噪声，应只保留有效任务意图与必要风格特征。\n\
-12. 不要生成与原样本几乎等价的问题；不要只替换数字、实体名、变量名、地名、人名或语言表面形式。\n\n\
-多样性要求：\n\
-- 与原样本相比，优先改变以下至少一项：\n\
-  - 输入材料\n\
-  - 判断对象\n\
-  - 约束条件\n\
-  - 边界情况\n\
-  - 题面设定\n\
-  - 测试重点\n\
-  - 推理路径\n\
-  - 输出组织方式\n\
-- 但改变后仍要保持同类任务、同级难度、同类回答方式。\n\n\
-输出格式：\n\
-返回纯 JSON，不要输出额外文字。\n\
-{{\n\
-  \"items\": [\n\
-    {{\n\
-      \"user\": \"...\",\n\
-      \"meta\": {{}}\n\
-    }}\n\
-  ]\n\
-}}\n\n\
-其中：\n\
-- items 必须恰好包含 {count} 个对象\n\
-- 每个对象的 user 为新的 user prompt\n\
-- 每个对象的 meta 可为空对象\n\n\
-输出前自检：\n\
-- 这些新样本是否只是原样本改写？如果是，重写。\n\
-- 这些新样本是否泄漏了原答案、历史回复或评测信息？如果是，重写。\n\
-- 这些新样本是否需要外部信息才能回答？如果是，重写。\n\
-- 这些新样本是否改变了任务类型或答题方式？如果是，重写。\n\
-- 这些新样本是否遵循事实性原则？若包含事实性内容，是否来自原样本已给出的信息框架，或属于无需检索即可回答的常见稳定事实？如果不是，重写。\n\
-- 这些新样本是否自然、清晰、完整？如果不是，重写。\n\n\
-原始 user prompt：\n{}\n{}{}",
-        sample.source_user, accepted_block, feedback_block
+    let accepted_json = serde_json::to_string_pretty(
+        &accepted
+            .iter()
+            .map(|task| json!({ "user": task.user }))
+            .collect::<Vec<_>>(),
+    )?;
+    let source_sample_json = serde_json::to_string_pretty(&json!({
+        "sample_id": sample.sample_id,
+        "user": sample.source_user,
+        "meta": sample.source_meta,
+    }))?;
+    Ok(render_prompt_template(
+        &prompt_templates.generation,
+        &[
+            ("profile_name", prompt_templates.profile_name.clone()),
+            ("variant_count", count.to_string()),
+            ("source_prompt", sample.source_user.clone()),
+            ("source_sample_json", source_sample_json),
+            ("accepted_samples_json", accepted_json),
+            ("accepted_block", accepted_block),
+            ("feedback", feedback.unwrap_or_default().to_owned()),
+            ("feedback_block", feedback_block),
+        ],
     ))
 }
 
@@ -1175,11 +1388,17 @@ fn validate_generated_item(
     draft: GeneratedItemDraft,
     sample: &SourceSample,
 ) -> Result<GeneratedItem> {
-    let user = draft.user.trim().to_owned();
+    let user = sanitize_training_user_prompt(draft.user.trim());
+    let answer = draft.answer.trim().to_owned();
     ensure!(!user.is_empty(), "generated user is empty");
+    ensure!(!answer.is_empty(), "generated answer is empty");
     ensure!(
         !user.starts_with("Assistant:"),
         "generated item must be a user prompt, not an assistant response"
+    );
+    ensure!(
+        !answer.starts_with("Assistant:"),
+        "generated answer must be the final answer only, not a dialogue transcript"
     );
 
     let user_norm = normalize_compare_text(&user);
@@ -1192,21 +1411,28 @@ fn validate_generated_item(
 
     let item_json = serde_json::to_string(&GeneratedItemDraft {
         user: user.clone(),
+        answer: answer.clone(),
         meta: draft.meta,
     })?;
 
-    Ok(GeneratedItem { user, item_json })
+    Ok(GeneratedItem {
+        user,
+        answer,
+        item_json,
+    })
 }
 
 async fn validate_generated_items_with_model(
     client: &OpenAiClient,
     model: &ModelConfig,
+    json_output: bool,
+    prompt_templates: &PromptTemplates,
     sample: &SourceSample,
     generated: &[GeneratedItemDraft],
 ) -> Result<()> {
-    let prompt = build_generation_validation_prompt(sample, generated)?;
+    let prompt = build_generation_validation_prompt(prompt_templates, sample, generated)?;
     let result = client
-        .chat(model, &prompt, true)
+        .chat(model, &prompt, json_output)
         .await
         .with_context(|| format!("validator failed for sample {}", sample.sample_id))?;
     let envelope: ValidationEnvelope =
@@ -1233,41 +1459,43 @@ async fn validate_generated_items_with_model(
 }
 
 fn build_generation_validation_prompt(
+    prompt_templates: &PromptTemplates,
     sample: &SourceSample,
     generated: &[GeneratedItemDraft],
 ) -> Result<String> {
-    Ok(format!(
-        "你是训练样本质检器。\n\
-返回纯 JSON：{{\"items\":[{{\"index\":0,\"valid\":true,\"reason\":\"...\"}}]}}\n\
-items 长度必须与候选样本数量一致，每项只能有 index、valid、reason。\n\n\
-只有同时满足以下条件时才判 valid=true：\n\
-1. 与原样本保持同一知识域、任务风格和语言风格。\n\
-2. 不是简单同义改写或表面改写。\n\
-3. 新样本与原样本相关但本质不同。\n\
-4. 新样本是自包含的，不依赖外部检索、图片、历史上下文或隐藏前提。\n\
-5. 新样本本身是一个 user prompt，而不是 assistant answer。\n\
-6. 候选样本本身清晰、自然，不是低质量、冷门或明显拼凑的特例。\n\n\
-不通过时，reason 只写最关键的失败原因，例如：表述改写 / 与原任务本质相同 / 需要外部知识 / 不是 user prompt / 低质量拼接。\n\n\
-原始样本：\n{}\n\n\
-候选样本：\n{}\n",
-        serde_json::to_string_pretty(&json!({
-            "sample_id": sample.sample_id,
-            "user": sample.source_user,
-            "meta": sample.source_meta,
-        }))?,
-        serde_json::to_string_pretty(
-            &generated
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    json!({
-                        "index": index,
-                        "user": item.user,
-                        "meta": item.meta,
-                    })
+    let validation_template = prompt_templates.validation.as_ref().ok_or_else(|| {
+        anyhow!(
+            "prompt profile {} is missing validation template",
+            prompt_templates.profile_name
+        )
+    })?;
+    let source_sample_json = serde_json::to_string_pretty(&json!({
+        "sample_id": sample.sample_id,
+        "user": sample.source_user,
+        "meta": sample.source_meta,
+    }))?;
+    let generated_candidates_json = serde_json::to_string_pretty(
+        &generated
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                json!({
+                    "index": index,
+                    "user": item.user,
+                    "answer": item.answer,
+                    "meta": item.meta,
                 })
-                .collect::<Vec<_>>()
-        )?
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(render_prompt_template(
+        validation_template,
+        &[
+            ("profile_name", prompt_templates.profile_name.clone()),
+            ("source_prompt", sample.source_user.clone()),
+            ("source_sample_json", source_sample_json),
+            ("generated_candidates_json", generated_candidates_json),
+        ],
     ))
 }
 
@@ -1392,10 +1620,34 @@ fn append_chunk_text(value: &Value, key: &str, out: &mut String) {
 
 fn merge_answer_output(reasoning: Option<String>, content: String) -> String {
     match (reasoning.map(|text| text.trim().to_owned()), content.trim()) {
-        (Some(reasoning), "") => reasoning,
-        (Some(reasoning), content) => format!("{reasoning}\n\n{content}"),
+        (Some(reasoning), "") => format!("<think>\n{reasoning}\n</think>"),
+        (Some(reasoning), content) => format!("<think>\n{reasoning}\n</think>\n\n{content}"),
         (None, content) => content.to_owned(),
     }
+}
+
+fn build_answer_prompt(user: &str) -> String {
+    format!(
+        r#"{user}
+
+Additional output rules:
+1. Keep the provider's native reasoning style if reasoning is produced; do not add a second reasoning block or rewrite the format.
+2. If reasoning is produced, keep it very short and only include the key basis for choosing the correct option.
+3. Do not repeat or paraphrase the question.
+4. Do not restate or enumerate all choices unless absolutely necessary.
+5. Do not include hesitation, self-dialogue, meta-commentary, or format self-checks.
+6. Do not output phrases like "The answer is F", "Final answer", or "答案是F".
+7. Do not use formatting like \boxed{{F}}.
+8. The final answer must end with exactly one uppercase option letter only, such as F.
+9. Do not output any extra explanation after the final option letter.
+10. Bad style examples that must not appear:
+- "First, let me analyze this question"
+- "Now I will check each option"
+- "The question is asking about..."
+- "Therefore, the final answer is F"
+
+Return the answer in the provider's native format, with concise reasoning if any, and end with a single uppercase option letter."#
+    )
 }
 
 fn rwkv_text(user: &str, assistant: &str) -> String {
@@ -1414,6 +1666,111 @@ fn generated_output_row(task: &PendingTask) -> OutputRow {
     }
 }
 
+fn done_output_path(paths: &OutputPaths, correct: bool) -> &Path {
+    if correct {
+        &paths.done_success_jsonl_path
+    } else {
+        &paths.done_failed_jsonl_path
+    }
+}
+
+fn expected_answer_from_generated_item_json(text: &str) -> Result<String> {
+    let draft: GeneratedItemDraft = serde_json::from_str(text)
+        .context("generated_item_json is not valid GeneratedItemDraft JSON")?;
+    let answer = draft.answer.trim().to_owned();
+    ensure!(!answer.is_empty(), "generated_item_json answer is empty");
+    Ok(answer)
+}
+
+fn extract_predicted_answer(expected_answer: &str, content: &str, assistant: &str) -> String {
+    let primary = if !content.trim().is_empty() {
+        content.trim()
+    } else {
+        assistant.trim()
+    };
+
+    if canonical_answer_label(expected_answer).is_some() {
+        return canonical_answer_label(primary).unwrap_or(label_fallback(primary));
+    }
+
+    last_non_empty_line(primary)
+        .unwrap_or(primary)
+        .trim()
+        .to_owned()
+}
+
+fn compare_expected_and_predicted(expected: &str, predicted: &str) -> bool {
+    if let Some(expected_label) = canonical_answer_label(expected) {
+        return canonical_answer_label(predicted)
+            .map(|predicted_label| predicted_label == expected_label)
+            .unwrap_or(false);
+    }
+
+    normalize_compare_text(expected) == normalize_compare_text(predicted)
+}
+
+fn canonical_answer_label(text: &str) -> Option<String> {
+    let mut labels = text
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | '.'
+                        | ';'
+                        | ':'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '：'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '（'
+                        | '）'
+                        | '【'
+                        | '】'
+                )
+        })
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+            if token.len() == 1 {
+                let ch = token.chars().next()?.to_ascii_uppercase();
+                ch.is_ascii_uppercase().then(|| ch.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(label) = labels.pop() {
+        return Some(label);
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    for index in (0..chars.len()).rev() {
+        let ch = chars[index].to_ascii_uppercase();
+        if !ch.is_ascii_uppercase() {
+            continue;
+        }
+        let prev_is_alpha = index > 0 && chars[index - 1].is_ascii_alphabetic();
+        let next_is_alpha = index + 1 < chars.len() && chars[index + 1].is_ascii_alphabetic();
+        if !prev_is_alpha && !next_is_alpha {
+            return Some(ch.to_string());
+        }
+    }
+    None
+}
+
+fn label_fallback(text: &str) -> String {
+    last_non_empty_line(text).unwrap_or(text).trim().to_owned()
+}
+
+fn last_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().rev().find(|line| !line.trim().is_empty())
+}
+
 fn task_id(sample_id: &str, variant_index: usize) -> String {
     format!("{sample_id}_q{variant_index:03}")
 }
@@ -1425,6 +1782,43 @@ fn pick_model_index(task_id: &str, count: usize) -> usize {
 }
 
 fn load_input_rows_window(
+    path: &Path,
+    start_index: usize,
+    limit: Option<usize>,
+) -> Result<Vec<(usize, Value)>> {
+    match detect_input_format(path)? {
+        InputFormat::JsonArray => load_input_rows_window_json_array(path, start_index, limit),
+        InputFormat::JsonLines => load_input_rows_window_jsonl(path, start_index, limit),
+    }
+}
+
+fn detect_input_format(path: &Path) -> Result<InputFormat> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open input file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    loop {
+        let buf = reader.fill_buf()?;
+        ensure!(!buf.is_empty(), "input file {} is empty", path.display());
+
+        let mut consumed = 0usize;
+        for byte in buf {
+            if byte.is_ascii_whitespace() {
+                consumed += 1;
+                continue;
+            }
+            return Ok(if *byte == b'[' {
+                InputFormat::JsonArray
+            } else {
+                InputFormat::JsonLines
+            });
+        }
+
+        reader.consume(consumed);
+    }
+}
+
+fn load_input_rows_window_jsonl(
     path: &Path,
     start_index: usize,
     limit: Option<usize>,
@@ -1470,6 +1864,28 @@ fn load_input_rows_window(
     Ok(out)
 }
 
+fn load_input_rows_window_json_array(
+    path: &Path,
+    start_index: usize,
+    limit: Option<usize>,
+) -> Result<Vec<(usize, Value)>> {
+    let take_limit = limit.unwrap_or(usize::MAX);
+    if take_limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path)
+        .with_context(|| format!("failed to open input file {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    JsonArrayWindowLoader {
+        start_index,
+        take_limit,
+    }
+    .deserialize(&mut deserializer)
+    .with_context(|| format!("failed to parse JSON array input from {}", path.display()))
+}
+
 fn read_jsonl<T: DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for (line_no, item) in json_lines::<T, _>(path)?.enumerate() {
@@ -1503,28 +1919,32 @@ fn append_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
 }
 
 fn build_output_paths(output: &OutputConfig) -> Result<OutputPaths> {
-    let legacy_jsonl_path = output.jsonl_path.clone();
     let base_dir = output
         .jsonl_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("data"));
-    let file_name = output
+    let dataset_name = output
         .jsonl_path
-        .file_name()
-        .ok_or_else(|| anyhow!("output.jsonl_path must include a file name"))?;
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| anyhow!("output.jsonl_path must include a valid file stem"))?;
+    let dataset_dir = base_dir.join(dataset_name);
 
     Ok(OutputPaths {
-        legacy_jsonl_path,
-        generate_jsonl_path: base_dir.join("generate").join(file_name),
-        done_jsonl_path: base_dir.join("done").join(file_name),
+        generate_jsonl_path: dataset_dir.join("generate").join("tasks.jsonl"),
+        done_success_jsonl_path: dataset_dir.join("done").join("success.jsonl"),
+        done_failed_jsonl_path: dataset_dir.join("done").join("failed.jsonl"),
     })
 }
 
 fn prepare_output(paths: &OutputPaths, resume: bool) -> Result<()> {
     for parent in [
         paths.generate_jsonl_path.parent(),
-        paths.done_jsonl_path.parent(),
+        paths.done_success_jsonl_path.parent(),
+        paths.done_failed_jsonl_path.parent(),
     ]
     .into_iter()
     .flatten()
@@ -1533,7 +1953,8 @@ fn prepare_output(paths: &OutputPaths, resume: bool) -> Result<()> {
     }
     if !resume {
         File::create(&paths.generate_jsonl_path)?;
-        File::create(&paths.done_jsonl_path)?;
+        File::create(&paths.done_success_jsonl_path)?;
+        File::create(&paths.done_failed_jsonl_path)?;
     }
     Ok(())
 }
@@ -1550,16 +1971,39 @@ fn load_resume_rows(paths: &OutputPaths) -> Result<HashMap<String, OutputRow>> {
     let mut rows = HashMap::new();
 
     for (path, label) in [
-        (&paths.legacy_jsonl_path, "legacy output"),
         (&paths.generate_jsonl_path, "generated output"),
-        (&paths.done_jsonl_path, "done output"),
+        (&paths.done_success_jsonl_path, "done success output"),
+        (&paths.done_failed_jsonl_path, "done failed output"),
     ] {
         for row in read_jsonl_if_exists::<OutputRow>(path, label)? {
-            rows.insert(row.task_id.clone(), row);
+            if let Some(existing) = rows.get_mut(&row.task_id) {
+                merge_output_row(existing, row);
+            } else {
+                rows.insert(row.task_id.clone(), row);
+            }
         }
     }
 
     Ok(rows)
+}
+
+fn merge_output_row(existing: &mut OutputRow, incoming: OutputRow) {
+    existing.status = incoming.status;
+    if !incoming.user.is_empty() {
+        existing.user = incoming.user;
+    }
+    if !incoming.generated_item_json.is_empty() {
+        existing.generated_item_json = incoming.generated_item_json;
+    }
+    if !incoming.answer_model.is_empty() {
+        existing.answer_model = incoming.answer_model;
+    }
+    if !incoming.assistant.is_empty() {
+        existing.assistant = incoming.assistant;
+    }
+    if !incoming.text.is_empty() {
+        existing.text = incoming.text;
+    }
 }
 
 fn summarize_resume_rows(rows: &HashMap<String, OutputRow>) -> Result<(usize, usize)> {
@@ -1579,9 +2023,17 @@ fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTask> {
         "generated resume row is missing user for task {}",
         row.task_id
     );
+    let expected_answer = expected_answer_from_generated_item_json(&row.generated_item_json)
+        .with_context(|| {
+            format!(
+                "generated resume row has invalid generated_item_json for task {}",
+                row.task_id
+            )
+        })?;
     Ok(PendingTask {
         task_id: row.task_id.clone(),
         user: user.to_owned(),
+        expected_answer,
         generated_item_json: row.generated_item_json.trim().to_owned(),
     })
 }
@@ -1627,6 +2079,14 @@ fn preview_text(text: &str, limit: usize) -> String {
     }
 }
 
+fn render_prompt_template(template: &str, vars: &[(&str, String)]) -> String {
+    let mut rendered = template.to_owned();
+    for (key, value) in vars {
+        rendered = rendered.replace(&format!("{{{{{key}}}}}"), value);
+    }
+    rendered
+}
+
 fn progress_bar(total: usize, label: &str) -> ProgressBar {
     if total == 0 {
         return ProgressBar::hidden();
@@ -1661,6 +2121,7 @@ default_value!(default_answer_requests, usize, 16);
 default_value!(default_generation_attempts, usize, 4);
 default_value!(default_validate_generated_questions, bool, true);
 default_value!(default_generator_json_object_response, bool, true);
+default_value!(default_validator_json_object_response, bool, true);
 
 impl Default for OutputConfig {
     fn default() -> Self {
@@ -1696,5 +2157,57 @@ impl RunStatus {
             Self::Generated => "generated",
             Self::Done => "done",
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InputFormat {
+    JsonArray,
+    JsonLines,
+}
+
+struct JsonArrayWindowLoader {
+    start_index: usize,
+    take_limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonArrayWindowLoader {
+    type Value = Vec<(usize, Value)>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for JsonArrayWindowLoader {
+    type Value = Vec<(usize, Value)>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a top-level JSON array of objects")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut out = Vec::new();
+        let mut logical_index = 0usize;
+
+        while let Some(value) = seq.next_element::<Value>()? {
+            if logical_index >= self.start_index && out.len() < self.take_limit {
+                out.push((logical_index, value));
+            }
+            logical_index += 1;
+
+            if out.len() >= self.take_limit {
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+                break;
+            }
+        }
+
+        Ok(out)
     }
 }

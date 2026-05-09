@@ -1,58 +1,46 @@
 [input]
-# Real evaluation-pipeline export: top-level JSON is structured, and context is the raw context string.
 dataset_path = "cmmlu_task122_failed_contexts.jsonl"
 limit = 10
 start_index = 0
 default_subject = "cmmlu/task122"
 
+[prompt]
+profile_path = "prompts/multiple_choice.toml"
+
 [generator]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "gpt-5.4"
-api_key = "YOUR_API_KEY"
-variant_count = 10
-generation_attempts = 4
+endpoint = "https://api.example.com/v1/chat/completions"
+model_name = "generator-model"
+api_key = "YOUR_GENERATOR_API_KEY"
+variant_count = 6
+generation_attempts = 10
 validate_generated_questions = true
+json_object_response = false
+validator_json_object_response = true
+max_completion_tokens = 4096
+
+[validator]
+endpoint = "https://api.example.com/v1/chat/completions"
+model_name = "validator-model"
+api_key = "YOUR_VALIDATOR_API_KEY"
+json_object_response = true
+max_completion_tokens = 1024
+
+[[answer_models]]
+endpoint = "https://api.example.com/v1/chat/completions"
+model_name = "answer-model"
+api_key = "YOUR_ANSWER_API_KEY"
 max_completion_tokens = 512
-
-[[answer_models]]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "qwen3-235b-a22b-thinking-2507"
-api_key = "YOUR_API_KEY"
-max_completion_tokens = 2048
-
-[[answer_models]]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "qwen3-30b-a3b-thinking-2507"
-api_key = "YOUR_API_KEY"
-max_completion_tokens = 2048
-
-[[answer_models]]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "deepseek-reasoner"
-api_key = "YOUR_API_KEY"
-max_completion_tokens = 2048
-
-[[answer_models]]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "kimi-k2-thinking"
-api_key = "YOUR_API_KEY"
-max_completion_tokens = 2048
-
-[[answer_models]]
-endpoint = "https://api.ablai.top/v1/chat/completions"
-model_name = "qwen3-next-80b-a3b-thinking"
-api_key = "YOUR_API_KEY"
-max_completion_tokens = 2048
 
 [output]
 jsonl_path = "data/rwkv_train.jsonl"
 
 [run]
 resume = true
+answer_generated = true
 request_timeout_seconds = 240
 disable_env_proxy = true
 force_http1 = true
 
 [concurrency]
-generate_requests = 8
-answer_requests = 32
+generate_requests = 4
+answer_requests = 16

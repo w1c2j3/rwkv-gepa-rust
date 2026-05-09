@@ -1,5 +1,10 @@
 target/
 data/
+.codex
+.codex/
+.idea/inspectionProfiles/
+__pycache__/
+*.py[cod]
 *.log
 config.*.toml
 mode.toml
@@ -8,3 +13,5 @@ mode.*.toml
 .env
 .env.*
 *.parquet
+cmmlu_task122_failed_contexts.jsonl
+sft.json

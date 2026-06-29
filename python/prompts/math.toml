@@ -1,0 +1,59 @@
+name = "math"
+task_kind = "math"
+answer_check = "exact_text"
+
+[synthesis]
+strategy = "subspace_contract_diversity"
+axes = [
+  "concept",
+  "operation_pattern",
+  "boundary_condition",
+  "numeric_scale",
+  "difficulty",
+]
+
+[generation]
+template = '''
+你要基于原始数学/计算错题 user prompt，生成 {{variant_count}} 条新的变种训练样本。
+
+要求：
+1. 保持原题语言、数学领域、题型和难度层级。
+2. 使用类似的解题技能，但改变数字、边界条件、约束组合或推理路径。
+3. answer 写最终标准答案本身；如果需要单位或格式，必须与题面要求一致。
+4. 不要引入需要查资料的事实，不要泄漏原答案或历史模型错误。
+5. meta 必须包含 task_kind、domain、skill_node、semantic_plan、changed_factor、difficulty、validation_contract、diversity_signature。
+
+合成策略参考：
+{{synthesis_profile_json}}
+
+返回纯 JSON：
+{"items":[{"user":"...","answer":"...","meta":{}}]}
+
+原始样本：
+{{source_sample_json}}
+
+已接受样本：
+{{accepted_samples_json}}
+{{feedback_block}}
+'''
+
+[validation]
+template = '''
+你是数学训练样本质检器，当前 profile 为 {{profile_name}}。
+
+返回纯 JSON：
+{"items":[{"index":0,"valid":true,"reason":"..."}]}
+
+valid=true 的条件：
+1. 仍是同类数学/计算任务。
+2. 题面自包含，数值和约束清晰。
+3. answer 是可验证的最终答案，格式匹配题面。
+4. 不是原题同义改写，不是只换无关数字。
+5. 不存在多个合理答案或计算矛盾。
+
+原始样本：
+{{source_sample_json}}
+
+候选样本：
+{{generated_candidates_json}}
+'''

@@ -7,6 +7,7 @@ mod openai;
 mod output;
 mod pipeline;
 mod prompt;
+mod task;
 mod text;
 mod types;
 mod util;

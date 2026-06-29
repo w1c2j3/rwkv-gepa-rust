@@ -1,10 +1,10 @@
 [package]
-name = "rwkv-gepa-rust-v1"
+name = "rwkv-synth-pipeline"
 version = "0.1.0"
 edition = "2024"
-description = "Standalone Rust rewrite of the V1 RWKV GEPA synthesis pipeline"
+description = "Standalone Rust pipeline for RWKV synthetic data generation"
 license = "MIT"
-readme = "README.md"
+readme = "../README.md"
 
 [dependencies]
 anyhow = "1.0"

@@ -1,0 +1,59 @@
+name = "function_calling"
+task_kind = "function_calling"
+answer_check = "json_exact"
+
+[synthesis]
+strategy = "subspace_contract_diversity"
+axes = [
+  "tool_namespace",
+  "argument_schema",
+  "constraint_type",
+  "missing_argument_case",
+  "parallel_call_pattern",
+]
+
+[generation]
+template = '''
+你要基于原始 function-calling / tool-use JSON 错题或失败样本，生成 {{variant_count}} 条新的变种训练样本。
+
+要求：
+1. 保持工具调用任务类型，user 中必须给出工具 schema、可用函数或足够的参数约束。
+2. 改变参数组合、缺失信息、并行调用、嵌套 JSON、枚举值或约束冲突。
+3. answer 必须是严格 JSON，表示标准 tool call / function call 结果；不要 markdown。
+4. JSON key、类型、数组顺序和必填字段必须与题面契约一致。
+5. meta 必须包含 task_kind、tool_namespace、argument_schema、semantic_plan、changed_factor、validation_contract、diversity_signature。
+
+合成策略参考：
+{{synthesis_profile_json}}
+
+返回纯 JSON：
+{"items":[{"user":"...","answer":"{\"name\":\"...\",\"arguments\":{}}","meta":{}}]}
+
+原始样本：
+{{source_sample_json}}
+
+已接受样本：
+{{accepted_samples_json}}
+{{feedback_block}}
+'''
+
+[validation]
+template = '''
+你是 function-calling JSON 训练样本质检器，当前 profile 为 {{profile_name}}。
+
+返回纯 JSON：
+{"items":[{"index":0,"valid":true,"reason":"..."}]}
+
+valid=true 的条件：
+1. user 给出足够工具 schema 或参数契约。
+2. answer 是严格 JSON，字段和类型符合契约。
+3. 改变因素会真实改变 tool call 或 arguments。
+4. 不存在多种同样合理的 JSON 调用。
+5. 不输出 markdown、注释或自然语言解释。
+
+原始样本：
+{{source_sample_json}}
+
+候选样本：
+{{generated_candidates_json}}
+'''

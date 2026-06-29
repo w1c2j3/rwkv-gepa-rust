@@ -1,0 +1,62 @@
+[input]
+# Database remains the authoritative source. This path should point to a JSONL
+# snapshot exported from the DB for the current synthesis run.
+dataset_path = "cmmlu_task122_failed_contexts.jsonl"
+limit = 10
+start_index = 0
+default_subject = "cmmlu/task122"
+
+[prompt]
+profile_path = "prompts/knowledge.toml"
+selector_keys = ["profile", "task_kind", "domain", "subject", "dataset", "source"]
+
+[prompt.profiles]
+coding = "prompts/coding.toml"
+knowledge = "prompts/knowledge.toml"
+math = "prompts/math.toml"
+instruction_following = "prompts/instruction_following.toml"
+function_calling = "prompts/function_calling.toml"
+
+[generator]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+variant_count = 6
+generation_attempts = 10
+validate_generated_questions = true
+json_object_response = false
+validator_json_object_response = true
+max_completion_tokens = 4096
+
+[validator]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+json_object_response = true
+max_completion_tokens = 1024
+
+[[answer_models]]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+max_completion_tokens = 512
+
+[output]
+# Preferred: explicit run directory. Outputs are written under:
+#   <run_dir>/generate/tasks.jsonl
+#   <run_dir>/done/success.jsonl
+#   <run_dir>/done/failed.jsonl
+run_dir = "data/rwkv_train"
+# Legacy-compatible fallback if run_dir is omitted:
+# jsonl_path = "data/rwkv_train.jsonl"
+
+[run]
+resume = true
+answer_generated = true
+request_timeout_seconds = 240
+disable_env_proxy = true
+force_http1 = true
+
+[concurrency]
+generate_requests = 4
+answer_requests = 16

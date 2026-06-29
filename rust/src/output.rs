@@ -8,6 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_jsonlines::{append_json_lines, json_lines};
 
 use crate::config::OutputConfig;
+use crate::task::{AnswerCheckMode, TaskKind};
 use crate::types::{GeneratedItemDraft, OutputRow, PendingTask};
 
 #[derive(Clone)]
@@ -105,6 +106,24 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> 
 }
 
 pub(crate) fn build_output_paths(output: &OutputConfig) -> Result<OutputPaths> {
+    let dataset_dir = output_run_dir(output)?;
+
+    Ok(OutputPaths {
+        generate_jsonl_path: dataset_dir.join("generate").join("tasks.jsonl"),
+        done_success_jsonl_path: dataset_dir.join("done").join("success.jsonl"),
+        done_failed_jsonl_path: dataset_dir.join("done").join("failed.jsonl"),
+    })
+}
+
+fn output_run_dir(output: &OutputConfig) -> Result<PathBuf> {
+    if let Some(run_dir) = &output.run_dir {
+        ensure!(
+            !run_dir.as_os_str().is_empty(),
+            "output.run_dir must not be empty"
+        );
+        return Ok(run_dir.clone());
+    }
+
     let base_dir = output
         .jsonl_path
         .parent()
@@ -117,13 +136,7 @@ pub(crate) fn build_output_paths(output: &OutputConfig) -> Result<OutputPaths> {
         .map(str::trim)
         .filter(|stem| !stem.is_empty())
         .ok_or_else(|| anyhow!("output.jsonl_path must include a valid file stem"))?;
-    let dataset_dir = base_dir.join(dataset_name);
-
-    Ok(OutputPaths {
-        generate_jsonl_path: dataset_dir.join("generate").join("tasks.jsonl"),
-        done_success_jsonl_path: dataset_dir.join("done").join("success.jsonl"),
-        done_failed_jsonl_path: dataset_dir.join("done").join("failed.jsonl"),
-    })
+    Ok(base_dir.join(dataset_name))
 }
 
 pub(crate) fn prepare_output(paths: &OutputPaths, resume: bool) -> Result<()> {
@@ -185,8 +198,8 @@ pub(crate) fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTas
         "generated resume row is missing user for task {}",
         row.task_id
     );
-    let expected_answer = expected_answer_from_generated_item_json(&row.generated_item_json)
-        .with_context(|| {
+    let (expected_answer, task_kind, answer_check) =
+        resume_meta_from_generated_item_json(&row.generated_item_json).with_context(|| {
             format!(
                 "generated resume row has invalid generated_item_json for task {}",
                 row.task_id
@@ -197,6 +210,8 @@ pub(crate) fn pending_task_from_output_row(row: &OutputRow) -> Result<PendingTas
         user: user.to_owned(),
         expected_answer,
         generated_item_json: row.generated_item_json.trim().to_owned(),
+        task_kind,
+        answer_check,
     })
 }
 
@@ -213,12 +228,24 @@ pub(crate) fn parse_row_status(row: &OutputRow) -> Result<RunStatus> {
     }
 }
 
-fn expected_answer_from_generated_item_json(text: &str) -> Result<String> {
+fn resume_meta_from_generated_item_json(text: &str) -> Result<(String, TaskKind, AnswerCheckMode)> {
     let draft: GeneratedItemDraft = serde_json::from_str(text)
         .context("generated_item_json is not valid GeneratedItemDraft JSON")?;
     let answer = draft.answer.trim().to_owned();
     ensure!(!answer.is_empty(), "generated_item_json answer is empty");
-    Ok(answer)
+    let task_kind = draft
+        .meta
+        .get("task_kind")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskKind>(value).ok())
+        .unwrap_or_default();
+    let answer_check = draft
+        .meta
+        .get("answer_check")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AnswerCheckMode>(value).ok())
+        .unwrap_or_else(|| task_kind.default_answer_check());
+    Ok((answer, task_kind, answer_check))
 }
 
 fn merge_output_row(existing: &mut OutputRow, incoming: OutputRow) {
@@ -257,6 +284,7 @@ mod tests {
     #[test]
     fn build_output_paths_uses_dataset_stem_directory() {
         let output = OutputConfig {
+            run_dir: None,
             jsonl_path: PathBuf::from("data/train_set.jsonl"),
         };
 
@@ -273,6 +301,29 @@ mod tests {
         assert_eq!(
             paths.done_failed_jsonl_path,
             PathBuf::from("data/train_set/done/failed.jsonl")
+        );
+    }
+
+    #[test]
+    fn build_output_paths_prefers_explicit_run_dir() {
+        let output = OutputConfig {
+            run_dir: Some(PathBuf::from("runs/train_set")),
+            jsonl_path: PathBuf::from("ignored/legacy.jsonl"),
+        };
+
+        let paths = build_output_paths(&output).expect("paths should build");
+
+        assert_eq!(
+            paths.generate_jsonl_path,
+            PathBuf::from("runs/train_set/generate/tasks.jsonl")
+        );
+        assert_eq!(
+            paths.done_success_jsonl_path,
+            PathBuf::from("runs/train_set/done/success.jsonl")
+        );
+        assert_eq!(
+            paths.done_failed_jsonl_path,
+            PathBuf::from("runs/train_set/done/failed.jsonl")
         );
     }
 

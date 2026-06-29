@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::task::{AnswerCheckMode, TaskKind};
+
 #[derive(Clone)]
 pub(crate) struct SourceSample {
     pub(crate) sample_id: String,
@@ -21,6 +23,8 @@ pub(crate) struct PendingTask {
     pub(crate) user: String,
     pub(crate) expected_answer: String,
     pub(crate) generated_item_json: String,
+    pub(crate) task_kind: TaskKind,
+    pub(crate) answer_check: AnswerCheckMode,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

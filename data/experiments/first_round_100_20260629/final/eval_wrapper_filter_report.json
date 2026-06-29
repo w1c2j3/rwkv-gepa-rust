@@ -1,0 +1,42 @@
+{
+  "input": "cleaned from first_round_100 initial generation artifacts; original intermediate files deleted",
+  "kept": 81,
+  "removed": 19,
+  "kept_domain_counts": {
+    "coding": 20,
+    "function_calling": 20,
+    "instruction_following": 20,
+    "knowledge": 3,
+    "math": 18
+  },
+  "removed_domain_counts": {
+    "knowledge": 17,
+    "math": 2
+  },
+  "removed_indices": [
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70
+  ],
+  "outputs": {
+    "filtered_sft": "data/experiments/first_round_100_20260629/final/train_81_no_eval_wrappers.jsonl",
+    "filtered_tasks": "data/experiments/first_round_100_20260629/final/train_81_no_eval_wrappers_tasks.jsonl"
+  },
+  "cleanup_note": "Deleted raw DB snapshots, raw API responses, progress/rejected logs, temporary configs/scripts, contaminated train_100/train_83 files, and removed-sample JSONL copies to avoid accidental training contamination."
+}

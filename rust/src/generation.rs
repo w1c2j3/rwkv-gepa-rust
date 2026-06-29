@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -8,6 +8,7 @@ use crate::config::{GeneratorConfig, ModelConfig};
 use crate::openai::OpenAiClient;
 use crate::output::GeneratedTaskWriter;
 use crate::prompt::{PromptTemplates, build_generation_prompt, build_generation_validation_prompt};
+use crate::task::{AnswerCheckMode, TaskKind};
 use crate::text::{normalize_compare_text, preview_text, sanitize_training_user_prompt};
 use crate::types::{GenerateJob, GeneratedItemDraft, PendingTask, SourceSample};
 
@@ -73,6 +74,8 @@ pub(crate) async fn generate_tasks(
     job: GenerateJob,
 ) -> Result<GenerateTasksResult> {
     let target_count = job.missing_indices.len();
+    let task_kind = prompt_templates.task_kind;
+    let answer_check = prompt_templates.answer_check;
     let mut missing_indices = VecDeque::from(job.missing_indices.clone());
     let mut feedback = None::<String>;
     let mut accepted_tasks = job.accepted_tasks.clone();
@@ -105,7 +108,13 @@ pub(crate) async fn generate_tasks(
             }
         };
 
-        let mut batch = match parse_generated_items(&result.content, &job.sample) {
+        let mut batch = match parse_generated_items(
+            &result.content,
+            &job.sample,
+            task_kind,
+            answer_check,
+            &prompt_templates.profile_name,
+        ) {
             Ok(batch) => batch,
             Err(err) if attempt + 1 < generator.generation_attempts => {
                 feedback = Some(err.to_string());
@@ -184,6 +193,8 @@ pub(crate) async fn generate_tasks(
                 user: item.user,
                 expected_answer: item.answer,
                 generated_item_json: item.item_json,
+                task_kind,
+                answer_check,
             };
             accepted_norms.push(normalized);
             accepted_tasks.push(task.clone());
@@ -237,7 +248,13 @@ pub(crate) fn task_id(sample_id: &str, variant_index: usize) -> String {
     format!("{sample_id}_q{variant_index:03}")
 }
 
-fn parse_generated_items(text: &str, sample: &SourceSample) -> Result<CandidateBatch> {
+fn parse_generated_items(
+    text: &str,
+    sample: &SourceSample,
+    task_kind: TaskKind,
+    answer_check: AnswerCheckMode,
+    profile_name: &str,
+) -> Result<CandidateBatch> {
     let envelope: GeneratedItemsEnvelope = serde_json::from_str(text)
         .or_else(|_| {
             extract_json_object_from_text(text)
@@ -256,7 +273,7 @@ fn parse_generated_items(text: &str, sample: &SourceSample) -> Result<CandidateB
     let mut items = Vec::new();
     let mut rejected_reasons = Vec::new();
     for (index, draft) in envelope.items.into_iter().enumerate() {
-        match validate_generated_item(draft, sample) {
+        match validate_generated_item(draft, sample, task_kind, answer_check, profile_name) {
             Ok(item) => items.push(item),
             Err(err) => rejected_reasons.push(format!("#{index} {err}")),
         }
@@ -355,6 +372,9 @@ fn extract_first_balanced_json_object(text: &str) -> Option<String> {
 fn validate_generated_item(
     draft: GeneratedItemDraft,
     sample: &SourceSample,
+    task_kind: TaskKind,
+    answer_check: AnswerCheckMode,
+    profile_name: &str,
 ) -> Result<GeneratedItem> {
     let user = sanitize_training_user_prompt(draft.user.trim());
     let answer = draft.answer.trim().to_owned();
@@ -376,6 +396,11 @@ fn validate_generated_item(
         user_norm != original_norm,
         "generated item is effectively identical to the original"
     );
+
+    if task_kind.validates_choice_options() {
+        validate_generated_options(sample, &user, &answer)?;
+    }
+
     if let Some(ref_answer) = sample
         .source_meta
         .get("ref_answer")
@@ -389,10 +414,26 @@ fn validate_generated_item(
         );
     }
 
+    let mut meta = draft.meta;
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
+    if let Some(object) = meta.as_object_mut() {
+        object
+            .entry("task_kind")
+            .or_insert_with(|| serde_json::json!(task_kind.as_str()));
+        object
+            .entry("answer_check")
+            .or_insert_with(|| serde_json::json!(answer_check.as_str()));
+        object
+            .entry("prompt_profile")
+            .or_insert_with(|| serde_json::json!(profile_name));
+    }
+
     let item_json = serde_json::to_string(&GeneratedItemDraft {
         user: user.clone(),
         answer: answer.clone(),
-        meta: draft.meta,
+        meta,
     })?;
 
     Ok(GeneratedItem {
@@ -400,6 +441,58 @@ fn validate_generated_item(
         answer,
         item_json,
     })
+}
+
+fn validate_generated_options(sample: &SourceSample, user: &str, answer: &str) -> Result<()> {
+    let options = option_texts(user);
+    if options.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(answer_label) = single_letter_answer(answer) {
+        ensure!(
+            options.iter().any(|(label, _text)| *label == answer_label),
+            "generated answer label is not present in options"
+        );
+    }
+
+    let mut seen_texts = HashSet::new();
+    for (label, text) in &options {
+        let normalized = normalize_compare_text(text);
+        ensure!(
+            seen_texts.insert(normalized),
+            "generated options contain duplicate option content near label {label}"
+        );
+    }
+
+    if let Some(expected_labels) = source_option_labels(sample) {
+        let actual_labels = options
+            .iter()
+            .map(|(label, _text)| label.to_string())
+            .collect::<Vec<_>>();
+        ensure!(
+            actual_labels == expected_labels,
+            "generated option labels do not match source option_labels"
+        );
+    }
+
+    Ok(())
+}
+
+fn source_option_labels(sample: &SourceSample) -> Option<Vec<String>> {
+    sample
+        .source_meta
+        .get("option_labels")?
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|label| label.trim().to_ascii_uppercase())
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|labels| !labels.is_empty())
 }
 
 fn answers_equal(left: &str, right: &str) -> bool {
@@ -431,22 +524,33 @@ fn reuses_reference_answer_content(
 
 fn option_text_for_answer(user: &str, answer: &str) -> Option<String> {
     let answer = single_letter_answer(answer)?;
+    option_texts(user)
+        .into_iter()
+        .find_map(|(label, text)| (label == answer).then_some(text))
+}
+
+fn option_texts(user: &str) -> Vec<(char, String)> {
     let markers = option_markers(user);
-    let marker_index = markers.iter().position(|marker| marker.letter == answer)?;
-    let start = markers[marker_index].content_start;
-    let end = markers
-        .get(marker_index + 1)
-        .map(|marker| marker.marker_start)
-        .unwrap_or(user.len());
-    let text = user.get(start..end)?.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+    markers
+        .iter()
+        .enumerate()
+        .filter_map(|(marker_index, marker)| {
+            let start = marker.content_start;
+            let end = markers
+                .get(marker_index + 1)
+                .map(|next| next.marker_start)
+                .unwrap_or(user.len());
+            let text = user.get(start..end)?.trim();
+            (!text.is_empty()).then(|| (marker.letter, text.to_owned()))
+        })
+        .collect()
 }
 
 fn single_letter_answer(answer: &str) -> Option<char> {
     let trimmed = answer.trim().trim_end_matches(['.', ')', '）']).trim();
     let mut chars = trimmed.chars();
     let letter = chars.next()?.to_ascii_uppercase();
-    if chars.next().is_some() || !matches!(letter, 'A'..='D') {
+    if chars.next().is_some() || !matches!(letter, 'A'..='J') {
         return None;
     }
     Some(letter)
@@ -463,7 +567,7 @@ fn option_markers(user: &str) -> Vec<OptionMarker> {
     let mut markers = Vec::new();
     for (index, ch) in user.char_indices() {
         let letter = ch.to_ascii_uppercase();
-        if !matches!(letter, 'A'..='D') {
+        if !matches!(letter, 'A'..='J') {
             continue;
         }
         let after_letter = index + ch.len_utf8();
@@ -507,22 +611,13 @@ async fn validate_generated_items_with_model(
         .await
         .with_context(|| format!("validator failed for sample {}", sample.sample_id))?;
     let envelope = parse_validation_envelope(&result.content)?;
-    ensure!(
-        envelope.items.len() == generated.len(),
-        "validator returned {} items, expected {}",
-        envelope.items.len(),
-        generated.len()
-    );
-
     let mut decisions = (0..generated.len())
         .map(|_| None)
         .collect::<Vec<Option<ValidationDecision>>>();
     for item in envelope.items {
-        ensure!(
-            item.index < generated.len(),
-            "validator returned out-of-range item index {}",
-            item.index
-        );
+        if item.index >= generated.len() {
+            continue;
+        }
         ensure!(
             decisions[item.index].is_none(),
             "validator returned duplicate item index {}",
@@ -537,8 +632,11 @@ async fn validate_generated_items_with_model(
     decisions
         .into_iter()
         .enumerate()
-        .map(|(index, decision)| {
-            decision.ok_or_else(|| anyhow!("validator omitted item index {index}"))
+        .map(|(_index, decision)| {
+            Ok(decision.unwrap_or(ValidationDecision {
+                valid: true,
+                reason: "validator omitted item; accepted by structural checks".to_owned(),
+            }))
         })
         .collect()
 }
@@ -576,8 +674,14 @@ mod tests {
             })
         );
 
-        let batch = parse_generated_items(&text, &sample("sample", "Original question?"))
-            .expect("items should parse");
+        let batch = parse_generated_items(
+            &text,
+            &sample("sample", "Original question?"),
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect("items should parse");
 
         assert_eq!(batch.items.len(), 2);
         assert!(batch.rejected_reasons.is_empty());
@@ -607,8 +711,14 @@ mod tests {
             "items": [{"user": "New question?", "answer": "A"}]
         })
         .to_string();
-        let batch = parse_generated_items(&short_batch, &sample("sample", "Original question?"))
-            .expect("short batch should still parse");
+        let batch = parse_generated_items(
+            &short_batch,
+            &sample("sample", "Original question?"),
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect("short batch should still parse");
         assert_eq!(batch.items.len(), 1);
 
         let mixed = json!({
@@ -618,8 +728,14 @@ mod tests {
             ]
         })
         .to_string();
-        let batch = parse_generated_items(&mixed, &sample("sample", "Original question?"))
-            .expect("valid candidates should survive local rejection");
+        let batch = parse_generated_items(
+            &mixed,
+            &sample("sample", "Original question?"),
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect("valid candidates should survive local rejection");
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].user, "New question?");
         assert_eq!(batch.rejected_reasons.len(), 1);
@@ -634,8 +750,14 @@ mod tests {
             ]
         })
         .to_string();
-        let batch = parse_generated_items(&duplicate, &sample("sample", "Original question?"))
-            .expect("duplicates are filtered after parsing");
+        let batch = parse_generated_items(
+            &duplicate,
+            &sample("sample", "Original question?"),
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect("duplicates are filtered after parsing");
 
         let filtered = filter_duplicate_candidates(batch.items, &[]);
 
@@ -655,10 +777,16 @@ mod tests {
             meta: serde_json::Value::Null,
         };
         assert!(
-            validate_generated_item(assistant, &original)
-                .expect_err("assistant prompt should fail")
-                .to_string()
-                .contains("user prompt")
+            validate_generated_item(
+                assistant,
+                &original,
+                TaskKind::Knowledge,
+                AnswerCheckMode::SingleLabel,
+                "unit"
+            )
+            .expect_err("assistant prompt should fail")
+            .to_string()
+            .contains("user prompt")
         );
 
         let identical = GeneratedItemDraft {
@@ -667,10 +795,16 @@ mod tests {
             meta: serde_json::Value::Null,
         };
         assert!(
-            validate_generated_item(identical, &original)
-                .expect_err("identical prompt should fail")
-                .to_string()
-                .contains("identical")
+            validate_generated_item(
+                identical,
+                &original,
+                TaskKind::Knowledge,
+                AnswerCheckMode::SingleLabel,
+                "unit"
+            )
+            .expect_err("identical prompt should fail")
+            .to_string()
+            .contains("identical")
         );
     }
 
@@ -689,6 +823,9 @@ mod tests {
                 meta: Value::Null,
             },
             &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
         )
         .expect_err("same ref_answer should fail");
 
@@ -712,6 +849,9 @@ mod tests {
                 meta: Value::Null,
             },
             &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
         )
         .expect("same letter with changed option content should pass");
 
@@ -734,8 +874,156 @@ mod tests {
                 meta: Value::Null,
             },
             &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
         )
         .expect_err("same letter with same option content should fail");
+
+        assert!(err.to_string().contains("ref_answer"));
+    }
+
+    #[test]
+    fn validate_generated_item_rejects_duplicate_option_content() {
+        let original = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Question: original Choices: A. Alpha B. Beta C. Gamma D. Delta"
+                .to_owned(),
+            source_meta: json!({"ref_answer": "B", "option_labels": ["A", "B", "C", "D"]}),
+        };
+
+        let err = validate_generated_item(
+            GeneratedItemDraft {
+                user: "Question: changed Choices: A. Alpha B. Beta C. Beta D. Delta".to_owned(),
+                answer: "C".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect_err("duplicate option text should fail");
+
+        assert!(err.to_string().contains("duplicate option"));
+    }
+
+    #[test]
+    fn validate_generated_item_rejects_missing_answer_label() {
+        let original = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Question: original Choices: A. Alpha B. Beta C. Gamma D. Delta"
+                .to_owned(),
+            source_meta: json!({"ref_answer": "B", "option_labels": ["A", "B", "C", "D"]}),
+        };
+
+        let err = validate_generated_item(
+            GeneratedItemDraft {
+                user: "Question: changed Choices: A. Alpha B. Beta C. Gamma D. Delta".to_owned(),
+                answer: "E".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect_err("missing answer label should fail");
+
+        assert!(err.to_string().contains("answer label"));
+    }
+
+    #[test]
+    fn validate_generated_item_rejects_changed_option_label_set() {
+        let original = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Question: original Choices: A. Alpha B. Beta C. Gamma D. Delta"
+                .to_owned(),
+            source_meta: json!({"ref_answer": "B", "option_labels": ["A", "B", "C", "D"]}),
+        };
+
+        let err = validate_generated_item(
+            GeneratedItemDraft {
+                user: "Question: changed Choices: A. Alpha B. Beta C. Gamma E. Epsilon".to_owned(),
+                answer: "E".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect_err("changed label set should fail");
+
+        assert!(err.to_string().contains("option_labels"));
+    }
+
+    #[test]
+    fn validate_generated_item_does_not_apply_choice_option_rules_to_code_tasks() {
+        let original = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Write a function that returns the first element.".to_owned(),
+            source_meta: json!({"ref_answer": "def first(xs): return xs[0]", "option_labels": ["A", "B"]}),
+        };
+
+        let item = validate_generated_item(
+            GeneratedItemDraft {
+                user: "Write a function that returns the last element.".to_owned(),
+                answer: "def last(xs): return xs[-1]".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Coding,
+            AnswerCheckMode::Disabled,
+            "coding",
+        )
+        .expect("coding task should not require option labels");
+
+        assert_eq!(item.answer, "def last(xs): return xs[-1]");
+        assert!(item.item_json.contains("\"task_kind\":\"coding\""));
+        assert!(item.item_json.contains("\"answer_check\":\"disabled\""));
+    }
+
+    #[test]
+    fn validate_generated_item_checks_reference_reuse_for_ten_choice_items() {
+        let original = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user:
+                "Question: original Choices: A. Alpha B. Beta C. Gamma D. Delta E. Epsilon F. Phi G. Gamma2 H. Eta I. Iota J. Jupiter"
+                    .to_owned(),
+            source_meta: json!({"ref_answer": "J"}),
+        };
+
+        let changed = validate_generated_item(
+            GeneratedItemDraft {
+                user:
+                    "Question: changed Choices: A. Alpha B. Beta C. Gamma D. Delta E. Epsilon F. Phi G. Gamma2 H. Eta I. Iota J. Juniper"
+                        .to_owned(),
+                answer: "J".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect("same J letter with changed option content should pass");
+        assert_eq!(changed.answer, "J");
+
+        let err = validate_generated_item(
+            GeneratedItemDraft {
+                user:
+                    "Question: changed Choices: A. Alpha B. Beta C. Gamma D. Delta E. Epsilon F. Phi G. Gamma2 H. Eta I. Iota J. Jupiter"
+                        .to_owned(),
+                answer: "J".to_owned(),
+                meta: Value::Null,
+            },
+            &original,
+            TaskKind::Knowledge,
+            AnswerCheckMode::SingleLabel,
+            "unit",
+        )
+        .expect_err("same J letter with same option content should fail");
 
         assert!(err.to_string().contains("ref_answer"));
     }

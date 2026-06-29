@@ -14,7 +14,7 @@ use crate::output::{
     GeneratedTaskWriter, RunStatus, build_output_paths, load_resume_rows, parse_row_status,
     pending_task_from_output_row, prepare_output, summarize_resume_rows,
 };
-use crate::prompt::load_prompt_templates;
+use crate::prompt::load_prompt_library;
 use crate::types::{GenerateJob, OutputRow, PendingTask, SourceSample};
 use crate::util::concurrency_limit;
 
@@ -24,8 +24,8 @@ pub(crate) async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> 
         cfg.input.limit = Some(limit);
     }
     validate_config(&cfg)?;
-    let prompt_templates =
-        load_prompt_templates(&cfg.prompt, cfg.generator.validate_generated_questions)?;
+    let prompt_library =
+        load_prompt_library(&cfg.prompt, cfg.generator.validate_generated_questions)?;
 
     let samples = load_samples(&cfg)?;
     if samples.is_empty() {
@@ -115,7 +115,7 @@ pub(crate) async fn synthesize(path: &Path, limit: Option<usize>) -> Result<()> 
                 let client = client.clone();
                 let generator = generator.clone();
                 let validator = validator.clone();
-                let prompt_templates = prompt_templates.clone();
+                let prompt_templates = prompt_library.templates_for_sample(&job.sample);
                 let generated_task_writer = generated_task_writer.clone();
                 async move {
                     generate_tasks(

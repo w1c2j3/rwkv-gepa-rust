@@ -36,6 +36,8 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
@@ -89,19 +91,21 @@ impl OpenAiClient {
         prompt: &str,
         json_output: bool,
     ) -> Result<ChatResult> {
-        let max_attempts = 3usize;
+        let max_attempts = 5usize;
         for attempt in 0..max_attempts {
             match self.try_chat(model, prompt, json_output).await {
                 Ok(result) => return Ok(result),
                 Err(err) if err.transient && attempt + 1 < max_attempts => {
+                    let sleep_secs = retry_sleep_secs(attempt);
                     eprintln!(
-                        "transient chat error for model {} (attempt {}/{}): {}",
+                        "transient chat error for model {} (attempt {}/{}, retrying in {}s): {}",
                         model.model_name,
                         attempt + 1,
                         max_attempts,
+                        sleep_secs,
                         err
                     );
-                    tokio::time::sleep(Duration::from_secs((attempt + 1) as u64 * 2)).await;
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -151,9 +155,18 @@ impl OpenAiClient {
 
 impl RequestError {
     fn http(err: reqwest::Error) -> Self {
+        let kind = if err.is_timeout() {
+            "timeout"
+        } else if err.is_connect() {
+            "connect"
+        } else if err.is_body() {
+            "body"
+        } else {
+            "http"
+        };
         Self {
-            transient: err.is_timeout() || err.is_connect() || err.is_body(),
-            message: err.to_string(),
+            transient: err.is_connect() || err.is_body(),
+            message: format!("{kind} error: {err}"),
         }
     }
 
@@ -201,6 +214,7 @@ fn chat_request<'a>(model: &'a ModelConfig, prompt: &'a str, json_output: bool) 
         model: &model.model_name,
         messages,
         max_completion_tokens: model.max_completion_tokens,
+        temperature: model.temperature,
         reasoning_effort: model.reasoning_effort.as_deref(),
         stream: model.stream && !json_output,
         thinking: model.thinking.as_ref().map(|thinking| ThinkingRequest {
@@ -221,6 +235,11 @@ fn content_type_is_event_stream(content_type: Option<&str>) -> bool {
     content_type
         .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
         .unwrap_or(false)
+}
+
+fn retry_sleep_secs(attempt: usize) -> u64 {
+    let shift = attempt.min(4) as u32;
+    5 * (1u64 << shift)
 }
 
 fn parse_chat_result(body: &str) -> Result<ChatResult> {

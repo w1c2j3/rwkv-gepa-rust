@@ -1,8 +1,11 @@
-use std::fs;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 use anyhow::{Result, ensure};
 use serde::Deserialize;
+
+use crate::task::{AnswerCheckMode, TaskKind};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,11 +25,31 @@ pub(crate) struct Config {
     pub(crate) concurrency: ConcurrencyConfig,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromptConfig {
     #[serde(default)]
     pub(crate) profile_path: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) profiles: BTreeMap<String, PathBuf>,
+    #[serde(default = "default_profile_selector_keys")]
+    pub(crate) selector_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) task_kind: TaskKind,
+    #[serde(default)]
+    pub(crate) answer_check: Option<AnswerCheckMode>,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            profile_path: None,
+            profiles: BTreeMap::new(),
+            selector_keys: default_profile_selector_keys(),
+            task_kind: TaskKind::default(),
+            answer_check: None,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -71,11 +94,16 @@ pub(crate) struct ValidatorConfig {
 pub(crate) struct ModelConfig {
     pub(crate) endpoint: String,
     pub(crate) model_name: String,
+    #[serde(default)]
     pub(crate) api_key: String,
+    #[serde(default)]
+    pub(crate) api_key_env: Option<String>,
     #[serde(default)]
     pub(crate) system_prompt: Option<String>,
     #[serde(default)]
     pub(crate) max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub(crate) temperature: Option<f32>,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
     #[serde(default)]
@@ -89,6 +117,8 @@ pub(crate) struct ModelConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutputConfig {
+    #[serde(default)]
+    pub(crate) run_dir: Option<PathBuf>,
     #[serde(default = "default_output_jsonl_path")]
     pub(crate) jsonl_path: PathBuf,
 }
@@ -131,6 +161,12 @@ pub(crate) fn load_config(path: &Path) -> Result<Config> {
     if let Some(profile_path) = &mut cfg.prompt.profile_path {
         *profile_path = resolve(base, profile_path);
     }
+    for profile_path in cfg.prompt.profiles.values_mut() {
+        *profile_path = resolve(base, profile_path);
+    }
+    if let Some(run_dir) = &mut cfg.output.run_dir {
+        *run_dir = resolve(base, run_dir);
+    }
     cfg.output.jsonl_path = resolve(base, &cfg.output.jsonl_path);
     trim_model_config(&mut cfg.generator.model);
     if let Some(validator) = &mut cfg.validator {
@@ -167,6 +203,19 @@ fn trim_model_config(model: &mut ModelConfig) {
     model.endpoint = model.endpoint.trim().to_owned();
     model.model_name = model.model_name.trim().to_owned();
     model.api_key = model.api_key.trim().to_owned();
+    if let Some(api_key_env) = &mut model.api_key_env {
+        *api_key_env = api_key_env.trim().to_owned();
+        if api_key_env.is_empty() {
+            model.api_key_env = None;
+        }
+    }
+    if model.api_key.is_empty() {
+        if let Some(api_key_env) = &model.api_key_env {
+            if let Ok(api_key) = env::var(api_key_env) {
+                model.api_key = api_key.trim().to_owned();
+            }
+        }
+    }
     if let Some(system_prompt) = &mut model.system_prompt {
         *system_prompt = system_prompt.trim().to_owned();
         if system_prompt.is_empty() {
@@ -219,6 +268,21 @@ fn default_output_jsonl_path() -> PathBuf {
     PathBuf::from("data/rwkv_train.jsonl")
 }
 
+fn default_profile_selector_keys() -> Vec<String> {
+    [
+        "profile",
+        "task_kind",
+        "task_type",
+        "domain",
+        "subject",
+        "dataset",
+        "source",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 fn default_resume() -> bool {
     true
 }
@@ -266,6 +330,7 @@ fn default_validator_json_object_response() -> bool {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
+            run_dir: None,
             jsonl_path: default_output_jsonl_path(),
         }
     }
@@ -322,6 +387,7 @@ reasoning_effort = " low "
 variant_count = 2
 
 [output]
+run_dir = "out/run"
 jsonl_path = "out/train.jsonl"
 
 [validator]
@@ -345,6 +411,10 @@ thinking = { type = " enabled " }
         assert_eq!(
             cfg.prompt.profile_path.as_deref(),
             Some(base.join("prompts/custom.toml").as_path())
+        );
+        assert_eq!(
+            cfg.output.run_dir.as_deref(),
+            Some(base.join("out/run").as_path())
         );
         assert_eq!(cfg.output.jsonl_path, base.join("out/train.jsonl"));
         assert_eq!(

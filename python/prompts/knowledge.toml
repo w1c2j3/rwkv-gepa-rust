@@ -1,8 +1,20 @@
-name = "general_task"
+name = "knowledge"
+task_kind = "knowledge"
+answer_check = "single_label"
+
+[synthesis]
+strategy = "subspace_contract_diversity"
+axes = [
+  "domain",
+  "skill_node",
+  "answer_deciding_factor",
+  "difficulty",
+  "option_label_distribution",
+]
 
 [generation]
 template = '''
-你要基于给定的原始 user prompt，生成 {{variant_count}} 条新的高质量训练样本。
+你要基于给定的原始错题/失败样本 user prompt，生成 {{variant_count}} 条新的高质量变种训练样本。
 
 核心目标：
 生成“同领域近邻最小对比题/任务”。新样本看起来应当与原样本非常相关、题型一致、领域一致、问法相近，但必须通过改变少量关键条件，让标准答案、期望输出、关键结论或解法路径发生明确变化。
@@ -71,6 +83,8 @@ template = '''
       "user": "...",
       "answer": "...",
       "meta": {
+        "semantic_plan": "...",
+        "validation_contract": "...",
         "changed_factor": "...",
         "answer_shift": "different_from_original"
       }
@@ -82,6 +96,8 @@ template = '''
 - items 必须恰好包含 {{variant_count}} 个对象。
 - 每个对象的 user 为新的 user prompt，不能包含 assistant 答案或解析。
 - 每个对象的 answer 为该题标准答案本身；如果原题要求单个选项字母，则 answer 只写单个大写选项字母；如果原题是代码题，则 answer 按原题期望输出完整代码、补丁要点、SQL、最终输出或结论。
+- meta.semantic_plan 用很短短语描述任务电路：考点、答案决定因素、约束、答案形态。
+- meta.validation_contract 用很短短语描述可自动/半自动验证的条件。
 - meta.changed_factor 用很短短语说明改变了哪个答案决定条件，不要写推理过程。
 - meta.answer_shift 固定写 "different_from_original"；这里的 original 指原题参考正确答案，优先是 meta.ref_answer。如果你无法让答案与原题不同，必须重写，不要输出该样本。
 

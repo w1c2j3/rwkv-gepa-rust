@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::config::ModelConfig;
+use crate::task::{AnswerCheckMode, TaskKind};
 use crate::types::{GeneratedItemDraft, PendingTask, SourceSample};
 
 pub(crate) fn temp_path(name: &str) -> PathBuf {
@@ -13,7 +14,7 @@ pub(crate) fn temp_path(name: &str) -> PathBuf {
         .expect("system clock should be after UNIX_EPOCH")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "rwkv_gepa_rust_v1_test_{}_{}_{}",
+        "rwkv_synth_pipeline_test_{}_{}_{}",
         std::process::id(),
         nanos,
         name
@@ -50,6 +51,8 @@ pub(crate) fn pending_task(task_id: &str, user: &str, answer: &str) -> PendingTa
         user: user.to_owned(),
         expected_answer: answer.to_owned(),
         generated_item_json: generated_item_json(user, answer),
+        task_kind: TaskKind::Knowledge,
+        answer_check: AnswerCheckMode::SingleLabel,
     }
 }
 
@@ -58,8 +61,10 @@ pub(crate) fn model_config() -> ModelConfig {
         endpoint: "https://example.invalid/v1/chat/completions".to_owned(),
         model_name: "unit-model".to_owned(),
         api_key: "unit-key".to_owned(),
+        api_key_env: None,
         system_prompt: Some("system".to_owned()),
         max_completion_tokens: Some(16),
+        temperature: None,
         reasoning_effort: Some("low".to_owned()),
         stream: false,
         thinking: None,

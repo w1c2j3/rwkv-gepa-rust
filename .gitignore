@@ -2,9 +2,15 @@ target/
 data/
 .codex
 .codex/
-.idea/inspectionProfiles/
+/.idea/
+docs/.idea/
 __pycache__/
+**/__pycache__/
+.pytest_cache/
 *.py[cod]
+python/.venv/
+python/.mypy_cache/
+python/.ruff_cache/
 *.log
 config.*.toml
 mode.toml

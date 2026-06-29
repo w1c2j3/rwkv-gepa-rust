@@ -1,0 +1,58 @@
+name = "instruction_following"
+task_kind = "instruction_following"
+answer_check = "disabled"
+
+[synthesis]
+strategy = "subspace_contract_diversity"
+axes = [
+  "constraint_type",
+  "format_requirement",
+  "negative_instruction",
+  "ordering_requirement",
+  "difficulty",
+]
+
+[generation]
+template = '''
+你要基于原始指令遵循错题/失败样本 user prompt，生成 {{variant_count}} 条新的变种训练样本。
+
+要求：
+1. 保持原任务语言和指令遵循性质。
+2. 改变约束组合、格式要求、禁止项、排序要求或输出结构。
+3. answer 写严格满足所有约束的参考输出。
+4. user 必须自包含，不需要历史上下文或外部资料。
+5. meta 必须包含 task_kind、constraint_type、format_requirement、semantic_plan、changed_factor、validation_contract、diversity_signature。
+
+合成策略参考：
+{{synthesis_profile_json}}
+
+返回纯 JSON：
+{"items":[{"user":"...","answer":"...","meta":{}}]}
+
+原始样本：
+{{source_sample_json}}
+
+已接受样本：
+{{accepted_samples_json}}
+{{feedback_block}}
+'''
+
+[validation]
+template = '''
+你是指令遵循训练样本质检器，当前 profile 为 {{profile_name}}。
+
+返回纯 JSON：
+{"items":[{"index":0,"valid":true,"reason":"..."}]}
+
+valid=true 的条件：
+1. 指令清晰、可执行、自包含。
+2. answer 满足所有格式、数量、排序和禁止项约束。
+3. 新样本不是表面改写。
+4. 没有互相冲突或不可满足的要求。
+
+原始样本：
+{{source_sample_json}}
+
+候选样本：
+{{generated_candidates_json}}
+'''

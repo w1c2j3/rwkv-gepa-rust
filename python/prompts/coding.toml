@@ -1,0 +1,60 @@
+name = "coding"
+task_kind = "coding"
+answer_check = "disabled"
+
+[synthesis]
+strategy = "subspace_contract_diversity"
+axes = [
+  "language",
+  "api_contract",
+  "edge_case",
+  "failure_mode",
+  "complexity_requirement",
+  "difficulty",
+]
+
+[generation]
+template = '''
+你要基于原始代码错题/失败样本 user prompt，生成 {{variant_count}} 条新的代码变种训练样本。
+
+要求：
+1. 保持语言、任务类型和接口风格：实现题仍是实现题，调试题仍是调试题，SQL/算法/补全题不要互相漂移。
+2. 优先改变边界条件、错误处理、排序/去重规则、输入约束、复杂度目标或 API 契约。
+3. answer 写标准代码、补丁要点、SQL、输出或结论，必须符合题面要求。
+4. 不要引入未给出的文件、依赖、数据库 schema、网络请求或框架上下文。
+5. meta 必须包含 task_kind、language、skill_node、semantic_plan、changed_factor、edge_case、validation_contract、diversity_signature。
+
+合成策略参考：
+{{synthesis_profile_json}}
+
+返回纯 JSON：
+{"items":[{"user":"...","answer":"...","meta":{}}]}
+
+原始样本：
+{{source_sample_json}}
+
+已接受样本：
+{{accepted_samples_json}}
+{{feedback_block}}
+'''
+
+[validation]
+template = '''
+你是代码训练样本质检器，当前 profile 为 {{profile_name}}。
+
+返回纯 JSON：
+{"items":[{"index":0,"valid":true,"reason":"..."}]}
+
+valid=true 的条件：
+1. 任务类型、语言、接口和输入输出风格保持一致。
+2. 改变因素是真正影响实现或输出的条件。
+3. answer 与题面匹配，不依赖隐藏文件或外部系统。
+4. 样本包含足够上下文，可独立回答。
+5. 不存在明显无法运行、双解或未定义行为。
+
+原始样本：
+{{source_sample_json}}
+
+候选样本：
+{{generated_candidates_json}}
+'''

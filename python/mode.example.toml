@@ -1,0 +1,44 @@
+[input]
+# Database is the authoritative source. The Python prototype reads an extracted
+# JSONL snapshot for reproducibility and local debugging.
+limit = 10
+start_index = 0
+
+[input.db_snapshot]
+path = "../data/db_failed_samples.snapshot.jsonl"
+# Optional: command should write JSONL to stdout or directly update `path`.
+# command = ["psql", "-X", "-A", "-t", "-f", "sql/export_failed_samples.sql"]
+
+[prompt]
+profile_path = "prompts/knowledge.toml"
+selector_keys = ["profile", "task_kind", "domain", "subject", "dataset", "source"]
+
+[prompt.profiles]
+coding = "prompts/coding.toml"
+knowledge = "prompts/knowledge.toml"
+math = "prompts/math.toml"
+instruction_following = "prompts/instruction_following.toml"
+function_calling = "prompts/function_calling.toml"
+
+[generator]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+variant_count = 6
+generation_attempts = 6
+validate_generated_questions = true
+json_object_response = true
+max_completion_tokens = 4096
+
+[validator]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+json_object_response = true
+max_completion_tokens = 1024
+
+[output]
+run_dir = "../data/python_synth"
+
+[run]
+request_timeout_seconds = 240

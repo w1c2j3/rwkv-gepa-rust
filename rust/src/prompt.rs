@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::config::PromptConfig;
-use crate::task::{AnswerCheckMode, TaskKind};
+use crate::task::{AnswerCheckMode, AnswerStyle, TaskKind};
 use crate::types::{GeneratedItemDraft, PendingTask, SourceSample};
 
 #[derive(Clone)]
@@ -13,6 +13,7 @@ pub(crate) struct PromptTemplates {
     pub(crate) profile_name: String,
     pub(crate) task_kind: TaskKind,
     pub(crate) answer_check: AnswerCheckMode,
+    pub(crate) answer_style: AnswerStyle,
     synthesis: Option<SynthesisProfile>,
     generation: String,
     validation: Option<String>,
@@ -33,6 +34,8 @@ struct PromptProfileFile {
     task_kind: Option<TaskKind>,
     #[serde(default)]
     answer_check: Option<AnswerCheckMode>,
+    #[serde(default)]
+    answer_style: Option<AnswerStyle>,
     #[serde(default)]
     synthesis: Option<SynthesisProfile>,
     generation: PromptTemplateSection,
@@ -128,11 +131,15 @@ fn load_prompt_templates_from_text(
         .answer_check
         .or(prompt.answer_check)
         .unwrap_or_else(|| task_kind.default_answer_check());
+    let answer_style = profile
+        .answer_style
+        .unwrap_or_else(|| task_kind.default_answer_style());
 
     Ok(PromptTemplates {
         profile_name: profile.name.trim().to_owned(),
         task_kind,
         answer_check,
+        answer_style,
         synthesis: profile.synthesis,
         generation: profile.generation.template.trim().to_owned(),
         validation: profile
@@ -166,7 +173,9 @@ pub(crate) fn build_generation_prompt(
         "user": sample.source_user,
         "meta": sample.source_meta,
     }))?;
-    let synthesis_profile_json = serde_json::to_string_pretty(&prompt_templates.synthesis_json())?;
+    let answer_style = source_answer_style(sample, prompt_templates.answer_style);
+    let synthesis_profile_json =
+        serde_json::to_string_pretty(&prompt_templates.synthesis_json(answer_style))?;
     Ok(render_prompt_template(
         &prompt_templates.generation,
         &[
@@ -176,6 +185,7 @@ pub(crate) fn build_generation_prompt(
                 "answer_check",
                 prompt_templates.answer_check.as_str().to_owned(),
             ),
+            ("answer_style", answer_style.as_str().to_owned()),
             ("variant_count", count.to_string()),
             ("source_sample_json", source_sample_json),
             ("accepted_samples_json", accepted_json),
@@ -215,7 +225,9 @@ pub(crate) fn build_generation_validation_prompt(
             })
             .collect::<Vec<_>>(),
     )?;
-    let synthesis_profile_json = serde_json::to_string_pretty(&prompt_templates.synthesis_json())?;
+    let answer_style = source_answer_style(sample, prompt_templates.answer_style);
+    let synthesis_profile_json =
+        serde_json::to_string_pretty(&prompt_templates.synthesis_json(answer_style))?;
     Ok(render_prompt_template(
         validation_template,
         &[
@@ -225,6 +237,7 @@ pub(crate) fn build_generation_validation_prompt(
                 "answer_check",
                 prompt_templates.answer_check.as_str().to_owned(),
             ),
+            ("answer_style", answer_style.as_str().to_owned()),
             ("source_sample_json", source_sample_json),
             ("generated_candidates_json", generated_candidates_json),
             ("synthesis_profile_json", synthesis_profile_json),
@@ -233,7 +246,7 @@ pub(crate) fn build_generation_validation_prompt(
 }
 
 impl PromptTemplates {
-    fn synthesis_json(&self) -> serde_json::Value {
+    fn synthesis_json(&self, answer_style: AnswerStyle) -> serde_json::Value {
         let (strategy, axes) = self
             .synthesis
             .as_ref()
@@ -259,10 +272,114 @@ impl PromptTemplates {
         json!({
             "task_kind": self.task_kind.as_str(),
             "answer_check": self.answer_check.as_str(),
+            "answer_style": answer_style.as_str(),
+            "profile_default_answer_style": self.answer_style.as_str(),
             "strategy": strategy,
             "axes": axes,
         })
     }
+}
+
+pub(crate) fn source_answer_style(
+    sample: &SourceSample,
+    profile_default: AnswerStyle,
+) -> AnswerStyle {
+    if source_declares_cot(&sample.source_meta) {
+        return AnswerStyle::Cot;
+    }
+    if let Some(style) = sample
+        .source_meta
+        .get("answer_style")
+        .and_then(answer_style_from_value)
+    {
+        return style;
+    }
+    for key in ["ref_answer", "answer", "expected_answer"] {
+        if sample
+            .source_meta
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(contains_cot_marker)
+        {
+            return AnswerStyle::Cot;
+        }
+    }
+    profile_default
+}
+
+fn answer_style_from_value(value: &Value) -> Option<AnswerStyle> {
+    let raw = value.as_str()?.trim();
+    match normalize_profile_key(raw).as_str() {
+        "final_only" | "final" | "short_answer" | "answer_only" => Some(AnswerStyle::FinalOnly),
+        "brief_explanation" => Some(AnswerStyle::BriefExplanation),
+        "json_object" | "json" => Some(AnswerStyle::JsonObject),
+        "code" => Some(AnswerStyle::Code),
+        "function_call" | "function_calling" | "tool_call" => Some(AnswerStyle::FunctionCall),
+        "cot" | "fakecot" | "fake_cot" | "chain_of_thought" => Some(AnswerStyle::Cot),
+        _ => None,
+    }
+}
+
+fn source_declares_cot(meta: &Value) -> bool {
+    for key in [
+        "cot_mode",
+        "score_cot_mode",
+        "prompt_profile",
+        "cot_profile",
+        "answer_style",
+    ] {
+        if meta.get(key).is_some_and(value_declares_cot) {
+            return true;
+        }
+    }
+    meta.get("sampling_config").is_some_and(value_declares_cot)
+}
+
+fn value_declares_cot(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text_declares_cot(text),
+        Value::Array(items) => items.iter().any(value_declares_cot),
+        Value::Object(object) => object.values().any(value_declares_cot),
+        _ => false,
+    }
+}
+
+fn text_declares_cot(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let key = normalize_profile_key(trimmed);
+    if matches!(key.as_str(), "nocot" | "no_cot" | "no_chain_of_thought") {
+        return false;
+    }
+    if matches!(
+        key.as_str(),
+        "cot" | "fakecot" | "fake_cot" | "chain_of_thought"
+    ) {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("fakecot")
+        || lower.contains("fake_cot")
+        || lower.contains("chain-of-thought")
+        || lower.contains("chain of thought")
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|part| part == "cot")
+}
+
+fn contains_cot_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<think")
+        || lower.contains("(think)")
+        || lower.contains("step by step")
+        || lower.contains("chain-of-thought")
+        || lower.contains("chain of thought")
+        || text.contains("思考过程")
+        || text.contains("推理过程")
+        || text.contains("解题步骤")
+        || text.contains("逐步推理")
 }
 
 impl PromptLibrary {
@@ -336,6 +453,7 @@ mod tests {
         assert!(!templates.profile_name.is_empty());
         assert_eq!(templates.task_kind, TaskKind::Knowledge);
         assert_eq!(templates.answer_check, AnswerCheckMode::SingleLabel);
+        assert_eq!(templates.answer_style, AnswerStyle::FinalOnly);
         assert!(templates.generation.contains("{{source_sample_json}}"));
         assert!(
             templates
@@ -373,6 +491,7 @@ template = "validate {{generated_candidates_json}}"
         assert_eq!(templates.profile_name, "custom");
         assert_eq!(templates.task_kind, TaskKind::Coding);
         assert_eq!(templates.answer_check, AnswerCheckMode::Disabled);
+        assert_eq!(templates.answer_style, AnswerStyle::Code);
         assert_eq!(
             templates.generation,
             "generate {{task_kind}} {{answer_check}} {{synthesis_profile_json}} {{source_sample_json}}"
@@ -432,6 +551,7 @@ template = "coding validate {{generated_candidates_json}}"
         assert_eq!(templates.profile_name, "coding");
         assert_eq!(templates.task_kind, TaskKind::Coding);
         assert_eq!(templates.answer_check, AnswerCheckMode::Disabled);
+        assert_eq!(templates.answer_style, AnswerStyle::Code);
     }
 
     #[test]
@@ -440,6 +560,7 @@ template = "coding validate {{generated_candidates_json}}"
             profile_name: "unit".to_owned(),
             task_kind: TaskKind::Knowledge,
             answer_check: AnswerCheckMode::SingleLabel,
+            answer_style: AnswerStyle::FinalOnly,
             synthesis: None,
             generation: "profile={{profile_name}}\ncount={{variant_count}}\nsample={{source_sample_json}}\naccepted={{accepted_samples_json}}\n{{feedback_block}}".to_owned(),
             validation: None,
@@ -464,11 +585,72 @@ template = "coding validate {{generated_candidates_json}}"
     }
 
     #[test]
+    fn build_generation_prompt_preserves_source_cot_style() {
+        let templates = PromptTemplates {
+            profile_name: "unit".to_owned(),
+            task_kind: TaskKind::Math,
+            answer_check: AnswerCheckMode::ExactText,
+            answer_style: AnswerStyle::FinalOnly,
+            synthesis: None,
+            generation: "style={{answer_style}}\nsynthesis={{synthesis_profile_json}}".to_owned(),
+            validation: None,
+        };
+        let source = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original math question with visible reasoning format?".to_owned(),
+            source_meta: json!({"cot_mode": "CoT"}),
+        };
+        let accepted: Vec<PendingTask> = Vec::new();
+
+        let rendered = build_generation_prompt(&templates, &source, 1, &accepted, None)
+            .expect("prompt should render");
+
+        assert!(rendered.contains("style=cot"));
+        assert!(rendered.contains(r#""answer_style": "cot""#));
+        assert!(rendered.contains(r#""profile_default_answer_style": "final_only""#));
+    }
+
+    #[test]
+    fn source_answer_style_detects_cot_from_nested_sampling_config() {
+        let source = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original?".to_owned(),
+            source_meta: json!({"sampling_config": {"cot_mode": "FakeCoT"}}),
+        };
+
+        assert_eq!(
+            source_answer_style(&source, AnswerStyle::FinalOnly),
+            AnswerStyle::Cot
+        );
+
+        let explicit_default_but_cot_mode = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original?".to_owned(),
+            source_meta: json!({"answer_style": "final_only", "cot_mode": "CoT"}),
+        };
+        assert_eq!(
+            source_answer_style(&explicit_default_but_cot_mode, AnswerStyle::FinalOnly),
+            AnswerStyle::Cot
+        );
+
+        let no_cot = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original?".to_owned(),
+            source_meta: json!({"cot_mode": "NoCoT"}),
+        };
+        assert_eq!(
+            source_answer_style(&no_cot, AnswerStyle::FinalOnly),
+            AnswerStyle::FinalOnly
+        );
+    }
+
+    #[test]
     fn build_generation_validation_prompt_requires_validation_template() {
         let templates = PromptTemplates {
             profile_name: "unit".to_owned(),
             task_kind: TaskKind::Knowledge,
             answer_check: AnswerCheckMode::ExactText,
+            answer_style: AnswerStyle::FinalOnly,
             synthesis: None,
             generation: String::new(),
             validation: None,
@@ -486,6 +668,7 @@ template = "coding validate {{generated_candidates_json}}"
             profile_name: "unit".to_owned(),
             task_kind: TaskKind::Knowledge,
             answer_check: AnswerCheckMode::SingleLabel,
+            answer_style: AnswerStyle::FinalOnly,
             synthesis: None,
             generation: String::new(),
             validation: Some(

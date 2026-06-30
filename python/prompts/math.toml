@@ -1,6 +1,7 @@
 name = "math"
 task_kind = "math"
 answer_check = "exact_text"
+answer_style = "final_only"
 
 [synthesis]
 strategy = "subspace_contract_diversity"
@@ -19,9 +20,11 @@ template = '''
 要求：
 1. 保持原题语言、数学领域、题型和难度层级。
 2. 使用类似的解题技能，但改变数字、边界条件、约束组合或推理路径。
-3. answer 写最终标准答案本身；如果需要单位或格式，必须与题面要求一致。
+3. answer 必须匹配当前期望 answer_style={{answer_style}}；如果需要单位或格式，必须与题面要求一致。
 4. 不要引入需要查资料的事实，不要泄漏原答案或历史模型错误。
-5. meta 必须包含 task_kind、domain、skill_node、semantic_plan、changed_factor、difficulty、validation_contract、diversity_signature。
+5. 严格对齐源输出格式：answer_style=final_only 时只写最终答案，禁止完整推导、解释型答案、CoT、<think> 或“Let ... therefore ...”；answer_style=cot 时必须保留可见推理结构，并在推理后给出最终答案。
+6. 题目不能只是短模板 backfill；必须包含足够约束，覆盖代数、组合、概率、几何、数论、序列、期望等不同子空间。
+7. meta 必须包含 task_kind、answer_style、domain、skill_node、semantic_plan、changed_factor、difficulty、validation_contract、cluster_key、diversity_signature。
 
 合成策略参考：
 {{synthesis_profile_json}}
@@ -48,8 +51,9 @@ valid=true 的条件：
 1. 仍是同类数学/计算任务。
 2. 题面自包含，数值和约束清晰。
 3. answer 是可验证的最终答案，格式匹配题面。
-4. 不是原题同义改写，不是只换无关数字。
-5. 不存在多个合理答案或计算矛盾。
+4. answer_style 必须等于 synthesis_profile_json.answer_style；final_only 候选若包含推导过程、解释段落或 CoT，判 invalid；cot 候选若没有可见推理结构，判 invalid。
+5. 不是原题同义改写，不是只换无关数字。
+6. 不存在多个合理答案或计算矛盾。
 
 原始样本：
 {{source_sample_json}}

@@ -3,6 +3,9 @@
 # JSONL snapshot for reproducibility and local debugging.
 limit = 10
 start_index = 0
+# Prevent one repeated source concept from filling a whole domain batch.
+# Set to 0 to disable.
+source_cluster_limit_per_domain = 1
 
 [input.db_snapshot]
 path = "../data/db_failed_samples.snapshot.jsonl"
@@ -26,16 +29,40 @@ model_name = "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
 variant_count = 6
 generation_attempts = 6
+# Keep per-request generations small for reasoning APIs/proxies; the pipeline
+# will keep looping until variant_count is reached or attempts are exhausted.
+request_batch_size = 1
+generated_cluster_limit_per_domain = 2
 validate_generated_questions = true
 json_object_response = true
-max_completion_tokens = 4096
+merge_reasoning_content = false
+max_completion_tokens = 1536
+# Structured data generation should not spend budget on hidden reasoning; CoT
+# recovery belongs to answer-model probes below.
+enable_thinking = false
+reasoning_effort = "low"
 
 [validator]
 endpoint = "https://next-token.cc/v1/chat/completions"
 model_name = "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
 json_object_response = true
+merge_reasoning_content = false
 max_completion_tokens = 1024
+enable_thinking = false
+reasoning_effort = "low"
+
+# Python currently uses generator/validator only. For future Python answer-model
+# experiments, use this same model field shape and set merge_reasoning_content=true.
+[answer_model_example]
+endpoint = "https://next-token.cc/v1/chat/completions"
+model_name = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
+max_completion_tokens = 2048
+thinking = { type = "enabled" }
+enable_thinking = true
+reasoning_effort = "medium"
+merge_reasoning_content = true
 
 [output]
 run_dir = "../data/python_synth"

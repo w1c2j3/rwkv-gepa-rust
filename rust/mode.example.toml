@@ -39,7 +39,10 @@ max_completion_tokens = 1024
 endpoint = "https://next-token.cc/v1/chat/completions"
 model_name = "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_V4_PRO_API_KEY"
-max_completion_tokens = 512
+max_completion_tokens = 2048
+thinking = { type = "enabled" }
+enable_thinking = true
+reasoning_effort = "medium"
 
 [output]
 # Preferred: explicit run directory. Outputs are written under:

@@ -1,6 +1,7 @@
 name = "knowledge"
 task_kind = "knowledge"
 answer_check = "single_label"
+answer_style = "final_only"
 
 [synthesis]
 strategy = "subspace_contract_diversity"
@@ -40,7 +41,8 @@ template = '''
    - 如果原题答案是精确数值、温度、浓度、时间或标准参数，只有在你确信新对象的新数值是常见稳定知识时才输出；不要为了换答案编造相近小数值。
 5. 正确答案应与原样本完全不同。若原题 meta.ref_answer 中有原参考答案，新样本应优先让 answer 与 meta.ref_answer 不同；单选题优先换到不同选项字母。若因选项重排或新选项内容导致字母相同，该字母对应的正确选项文本也必须与原题 ref_answer 对应选项明显不同。不要只做到“不同于 meta.answer”却仍复用 meta.ref_answer 对应的正确答案内容。
 6. 只有在你确信答案正确且属于常见稳定知识时才输出该样本。不要为了满足“答案不同”而编造一个不确定的数值、标准或事实。
-7. 若是选择题，选项必须都合理、同量纲、同粒度、相互有区分度；错误选项要像真实干扰项，不能明显荒谬。
+7. 保持答案输出契约并匹配当前期望 answer_style={{answer_style}}：如果原题是单字母/短答案/final-only，新 answer 也必须是同类 final-only；如果原题是 CoT 样本，新 answer 必须保留可见推理结构并在推理后给出最终答案；不要在非 CoT 样本里输出解释段落、推导过程、CoT 或 <think>。
+8. 若是选择题，选项必须都合理、同量纲、同粒度、相互有区分度；错误选项要像真实干扰项，不能明显荒谬。
 8. 新样本必须自包含，不依赖图片、文件、外部网页、历史对话、隐藏上下文、未给出的背景事实或联网查询。
 9. 不要泄漏或复用原题答案、参考答案、判题结果、历史 assistant 回复、思维链或评测信息到 user 字段。
 10. 若原样本是单轮任务，新样本也必须是单轮任务。
@@ -83,8 +85,10 @@ template = '''
       "user": "...",
       "answer": "...",
       "meta": {
+        "answer_style": "{{answer_style}}",
         "semantic_plan": "...",
         "validation_contract": "...",
+        "cluster_key": "...",
         "changed_factor": "...",
         "answer_shift": "different_from_original"
       }
@@ -97,7 +101,9 @@ template = '''
 - 每个对象的 user 为新的 user prompt，不能包含 assistant 答案或解析。
 - 每个对象的 answer 为该题标准答案本身；如果原题要求单个选项字母，则 answer 只写单个大写选项字母；如果原题是代码题，则 answer 按原题期望输出完整代码、补丁要点、SQL、最终输出或结论。
 - meta.semantic_plan 用很短短语描述任务电路：考点、答案决定因素、约束、答案形态。
+- meta.answer_style 固定写当前 synthesis_profile_json.answer_style；final_only 样本只写最终答案，cot 样本必须保留可见推理结构。
 - meta.validation_contract 用很短短语描述可自动/半自动验证的条件。
+- meta.cluster_key 用很短短语标识题簇/考点，不同样本不要集中在同一题簇。
 - meta.changed_factor 用很短短语说明改变了哪个答案决定条件，不要写推理过程。
 - meta.answer_shift 固定写 "different_from_original"；这里的 original 指原题参考正确答案，优先是 meta.ref_answer。如果你无法让答案与原题不同，必须重写，不要输出该样本。
 
@@ -143,7 +149,8 @@ template = '''
 8. 改变后的条件必须足以让正确答案、期望输出或解法路径不同于原题；若看起来仍会相同，判 invalid。
 9. 原始样本 meta.ref_answer 是原题参考正确答案；如果 meta.answer 与 meta.ref_answer 冲突，meta.answer 视为历史错误答案或失败记录。候选 answer 不能只避开 meta.answer 却仍复用 meta.ref_answer 对应的正确答案内容；若候选 answer 字母等于 meta.ref_answer，但该字母的选项文本已经变成不同正确答案，可判为通过，否则判 invalid。
 10. 候选中的 answer 必须非空，且是这道题的标准答案本身；单选题应尽量只给单个选项字母，代码题必须符合原题要求的答案格式。
-11. answer 必须是稳定、可验证、可自洽的；如果像为了让答案不同而编造或硬凑，判 invalid。
+11. answer_style 必须与 synthesis_profile_json.answer_style 和原题输出契约一致；final-only 样本不能变成解释型答案、推理过程、CoT 或 <think>；cot 样本不能退化成只有最终答案。
+12. answer 必须是稳定、可验证、可自洽的；如果像为了让答案不同而编造或硬凑，判 invalid。
 12. 若是选择题，选项必须同量纲、同粒度、合理且唯一正确。
 13. 对制度、定义、分类、归因题，候选必须保持同一考点维度；如果只是同主题但换成相邻考点，例如从计税依据跳到税率形式、制度目的或课税对象，判 invalid。
 14. 对精确数值、温度、浓度、时间、标准参数题，候选答案必须是常见稳定事实；可疑小数值、拼凑参数或无法确信的数值判 invalid。

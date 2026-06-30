@@ -45,8 +45,8 @@ pub(crate) fn load_samples(cfg: &Config) -> Result<Vec<SourceSample>> {
 }
 
 fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<SourceSample> {
-    let context = required_top_level_text(&value, "context")
-        .or_else(|_| required_top_level_text(&value, "text"))
+    let context = required_context_text(&value, "context")
+        .or_else(|_| required_context_text(&value, "text"))
         .with_context(|| format!("sample_index={index} missing context/text"))?;
 
     let source_user = sanitize_training_user_prompt(
@@ -60,6 +60,16 @@ fn normalize_sample(_input: &InputConfig, index: usize, value: Value) -> Result<
 
     let mut meta = serde_json::Map::new();
     for key in [
+        "task_kind",
+        "profile",
+        "prompt_profile",
+        "domain",
+        "benchmark_name",
+        "benchmark_split",
+        "evaluator",
+        "cot_mode",
+        "answer_style",
+        "sampling_config",
         "task_id",
         "sample_index",
         "repeat_index",
@@ -362,6 +372,20 @@ fn required_top_level_text(value: &Value, key: &str) -> Result<String> {
     top_level_text(value, key).ok_or_else(|| anyhow!("missing {key}"))
 }
 
+fn required_context_text(value: &Value, key: &str) -> Result<String> {
+    let value = value.get(key).ok_or_else(|| anyhow!("missing {key}"))?;
+    if let Some(text) = scalar_text(value) {
+        return Ok(text);
+    }
+    match value {
+        Value::Array(_) | Value::Object(_) => Ok(serde_json::to_string(value)?),
+        Value::Null => Err(anyhow!("missing {key}")),
+        Value::String(_) | Value::Bool(_) | Value::Number(_) => {
+            unreachable!("scalar_text handles scalar values")
+        }
+    }
+}
+
 fn top_level_text(value: &Value, key: &str) -> Option<String> {
     scalar_text(value.get(key)?)
 }
@@ -501,7 +525,12 @@ api_key = "answer-key"
             "completions_id": "abc",
             "context": "User: You are a very talented expert in math. Question?\nAssistant: old",
             "answer": "A",
-            "subject": "math"
+            "subject": "math",
+            "task_kind": "coding",
+            "domain": "coding",
+            "benchmark_name": "mbpp",
+            "evaluator": "code_mbpp_naive",
+            "cot_mode": "NoCoT"
         });
 
         let sample = normalize_sample(&cfg.input, 3, value).expect("sample should normalize");
@@ -510,6 +539,49 @@ api_key = "answer-key"
         assert_eq!(sample.source_user, "Question?");
         assert_eq!(sample.source_meta["answer"], "A");
         assert_eq!(sample.source_meta["subject"], "math");
+        assert_eq!(sample.source_meta["task_kind"], "coding");
+        assert_eq!(sample.source_meta["domain"], "coding");
+        assert_eq!(sample.source_meta["benchmark_name"], "mbpp");
+        assert_eq!(sample.source_meta["evaluator"], "code_mbpp_naive");
+        assert_eq!(sample.source_meta["cot_mode"], "NoCoT");
+    }
+
+    #[test]
+    fn normalize_sample_extracts_user_from_structured_context_value() {
+        let config_path = temp_path("input/config_structured.toml");
+        write_text(
+            &config_path,
+            r#"
+[input]
+dataset_path = "unused.jsonl"
+
+[generator]
+endpoint = "https://generator.example/v1/chat/completions"
+model_name = "generator-model"
+api_key = "generator-key"
+variant_count = 1
+
+[[answer_models]]
+endpoint = "https://answer.example/v1/chat/completions"
+model_name = "answer-model"
+api_key = "answer-key"
+"#,
+        );
+        let cfg = load_config(&config_path).expect("config should load");
+        let value = json!({
+            "sample_id": "structured",
+            "context": {
+                "stages": [
+                    {"prompt": "User: Structured DB question?\nAssistant: old"}
+                ]
+            },
+            "task_kind": "math"
+        });
+
+        let sample = normalize_sample(&cfg.input, 0, value).expect("sample should normalize");
+
+        assert_eq!(sample.source_user, "Structured DB question?");
+        assert_eq!(sample.source_meta["task_kind"], "math");
     }
 
     #[test]

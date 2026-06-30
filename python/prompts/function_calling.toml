@@ -1,6 +1,7 @@
 name = "function_calling"
 task_kind = "function_calling"
 answer_check = "json_exact"
+answer_style = "function_call"
 
 [synthesis]
 strategy = "subspace_contract_diversity"
@@ -21,7 +22,9 @@ template = '''
 2. 改变参数组合、缺失信息、并行调用、嵌套 JSON、枚举值或约束冲突。
 3. answer 必须是严格 JSON，表示标准 tool call / function call 结果；不要 markdown。
 4. JSON key、类型、数组顺序和必填字段必须与题面契约一致。
-5. meta 必须包含 task_kind、tool_namespace、argument_schema、semantic_plan、changed_factor、validation_contract、diversity_signature。
+5. answer_style 固定为 function_call；不要输出自然语言解释、markdown fence、Assistant 前缀、CoT 或 <think>。
+6. 避免 schema 近重复；同一批内不要只换参数值，优先覆盖可选参数、多调用、嵌套对象、枚举和缺失信息处理。
+7. meta 必须包含 task_kind、answer_style、tool_namespace、argument_schema、semantic_plan、changed_factor、validation_contract、cluster_key、diversity_signature。
 
 合成策略参考：
 {{synthesis_profile_json}}
@@ -47,9 +50,10 @@ template = '''
 valid=true 的条件：
 1. user 给出足够工具 schema 或参数契约。
 2. answer 是严格 JSON，字段和类型符合契约。
-3. 改变因素会真实改变 tool call 或 arguments。
-4. 不存在多种同样合理的 JSON 调用。
-5. 不输出 markdown、注释或自然语言解释。
+3. answer_style 必须是 function_call，且工具名必须来自 user 中给出的工具 schema。
+4. 改变因素会真实改变 tool call 或 arguments。
+5. 不存在多种同样合理的 JSON 调用。
+6. 不输出 markdown、注释、Assistant 前缀、CoT 或自然语言解释。
 
 原始样本：
 {{source_sample_json}}

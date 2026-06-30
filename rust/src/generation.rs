@@ -7,8 +7,11 @@ use serde_json::Value;
 use crate::config::{GeneratorConfig, ModelConfig};
 use crate::openai::OpenAiClient;
 use crate::output::GeneratedTaskWriter;
-use crate::prompt::{PromptTemplates, build_generation_prompt, build_generation_validation_prompt};
-use crate::task::{AnswerCheckMode, TaskKind};
+use crate::prompt::{
+    PromptTemplates, build_generation_prompt, build_generation_validation_prompt,
+    source_answer_style,
+};
+use crate::task::{AnswerCheckMode, AnswerStyle, TaskKind};
 use crate::text::{normalize_compare_text, preview_text, sanitize_training_user_prompt};
 use crate::types::{GenerateJob, GeneratedItemDraft, PendingTask, SourceSample};
 
@@ -113,6 +116,7 @@ pub(crate) async fn generate_tasks(
             &job.sample,
             task_kind,
             answer_check,
+            source_answer_style(&job.sample, prompt_templates.answer_style),
             &prompt_templates.profile_name,
         ) {
             Ok(batch) => batch,
@@ -253,6 +257,7 @@ fn parse_generated_items(
     sample: &SourceSample,
     task_kind: TaskKind,
     answer_check: AnswerCheckMode,
+    answer_style: AnswerStyle,
     profile_name: &str,
 ) -> Result<CandidateBatch> {
     let envelope: GeneratedItemsEnvelope = serde_json::from_str(text)
@@ -273,7 +278,14 @@ fn parse_generated_items(
     let mut items = Vec::new();
     let mut rejected_reasons = Vec::new();
     for (index, draft) in envelope.items.into_iter().enumerate() {
-        match validate_generated_item(draft, sample, task_kind, answer_check, profile_name) {
+        match validate_generated_item(
+            draft,
+            sample,
+            task_kind,
+            answer_check,
+            answer_style,
+            profile_name,
+        ) {
             Ok(item) => items.push(item),
             Err(err) => rejected_reasons.push(format!("#{index} {err}")),
         }
@@ -374,6 +386,7 @@ fn validate_generated_item(
     sample: &SourceSample,
     task_kind: TaskKind,
     answer_check: AnswerCheckMode,
+    default_answer_style: AnswerStyle,
     profile_name: &str,
 ) -> Result<GeneratedItem> {
     let user = sanitize_training_user_prompt(draft.user.trim());
@@ -387,6 +400,10 @@ fn validate_generated_item(
     ensure!(
         !answer.starts_with("Assistant:"),
         "generated answer must be the final answer only, not a dialogue transcript"
+    );
+    ensure!(
+        !user.contains("Assistant: ```") && !answer.contains("Assistant: ```"),
+        "generated item contains assistant JSON prefill residue"
     );
 
     let user_norm = normalize_compare_text(&user);
@@ -418,6 +435,14 @@ fn validate_generated_item(
     if !meta.is_object() {
         meta = serde_json::json!({});
     }
+    let answer_style = answer_style_from_meta(&meta).unwrap_or(default_answer_style);
+    ensure!(
+        compatible_answer_style(default_answer_style, answer_style),
+        "answer_style drift: expected {}, got {}",
+        default_answer_style.as_str(),
+        answer_style.as_str()
+    );
+    validate_answer_style_contract(task_kind, answer_style, &answer)?;
     if let Some(object) = meta.as_object_mut() {
         object
             .entry("task_kind")
@@ -425,6 +450,9 @@ fn validate_generated_item(
         object
             .entry("answer_check")
             .or_insert_with(|| serde_json::json!(answer_check.as_str()));
+        object
+            .entry("answer_style")
+            .or_insert_with(|| serde_json::json!(answer_style.as_str()));
         object
             .entry("prompt_profile")
             .or_insert_with(|| serde_json::json!(profile_name));
@@ -441,6 +469,120 @@ fn validate_generated_item(
         answer,
         item_json,
     })
+}
+
+fn answer_style_from_meta(meta: &Value) -> Option<AnswerStyle> {
+    let raw = meta.get("answer_style")?.as_str()?.trim();
+    match raw {
+        "final_only" | "final" | "short_answer" | "answer_only" => Some(AnswerStyle::FinalOnly),
+        "brief_explanation" => Some(AnswerStyle::BriefExplanation),
+        "json_object" | "json" => Some(AnswerStyle::JsonObject),
+        "code" => Some(AnswerStyle::Code),
+        "function_call" | "function_calling" | "tool_call" => Some(AnswerStyle::FunctionCall),
+        "cot" | "chain_of_thought" => Some(AnswerStyle::Cot),
+        _ => None,
+    }
+}
+
+fn validate_answer_style_contract(
+    task_kind: TaskKind,
+    answer_style: AnswerStyle,
+    answer: &str,
+) -> Result<()> {
+    if answer_style == AnswerStyle::Cot {
+        ensure!(
+            contains_cot_marker(answer),
+            "answer_style=cot but generated answer has no CoT marker"
+        );
+    } else {
+        ensure!(
+            !contains_cot_marker(answer),
+            "generated answer leaks CoT/thinking markers without answer_style=cot"
+        );
+    }
+    match task_kind {
+        TaskKind::FunctionCalling => {
+            ensure!(
+                answer_style == AnswerStyle::FunctionCall
+                    || answer_style == AnswerStyle::JsonObject,
+                "function_calling answer_style must be function_call"
+            );
+            let value: Value = serde_json::from_str(answer)
+                .context("function_calling answer is not valid JSON")?;
+            let calls = value
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(&value));
+            ensure!(
+                !calls.is_empty(),
+                "function_calling answer must contain at least one call"
+            );
+            for call in calls {
+                ensure!(call.is_object(), "function_calling call must be an object");
+                ensure!(
+                    call.get("name").and_then(Value::as_str).is_some(),
+                    "function_calling call is missing name"
+                );
+                ensure!(
+                    call.get("arguments").is_some_and(Value::is_object),
+                    "function_calling call arguments must be an object"
+                );
+            }
+        }
+        TaskKind::Math | TaskKind::Knowledge => {
+            ensure!(
+                matches!(answer_style, AnswerStyle::FinalOnly | AnswerStyle::Cot),
+                "math/knowledge answers must keep source answer style"
+            );
+            if answer_style == AnswerStyle::FinalOnly {
+                ensure!(
+                    !looks_like_explanation(answer),
+                    "final_only answer drifted into explanation"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn compatible_answer_style(expected: AnswerStyle, actual: AnswerStyle) -> bool {
+    expected == actual
+        || matches!(
+            (expected, actual),
+            (AnswerStyle::JsonObject, AnswerStyle::FunctionCall)
+                | (AnswerStyle::FunctionCall, AnswerStyle::JsonObject)
+        )
+}
+
+fn contains_cot_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<think")
+        || lower.contains("(think)")
+        || lower.contains("step by step")
+        || lower.contains("chain-of-thought")
+        || lower.contains("chain of thought")
+        || text.contains("思考过程")
+        || text.contains("推理过程")
+        || text.contains("解题步骤")
+}
+
+fn looks_like_explanation(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.contains('\n')
+        || lower.contains("because")
+        || lower.contains("therefore")
+        || lower.contains("thus")
+        || lower.contains("hence")
+        || lower.contains("let ")
+        || lower.contains("total")
+        || lower.contains("common difference")
+        || trimmed.contains("因为")
+        || trimmed.contains("所以")
+        || trimmed.contains("因此")
+        || trimmed.contains("计算")
+        || trimmed.contains("答案是")
 }
 
 fn validate_generated_options(sample: &SourceSample, user: &str, answer: &str) -> Result<()> {
@@ -679,6 +821,7 @@ mod tests {
             &sample("sample", "Original question?"),
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("items should parse");
@@ -716,6 +859,7 @@ mod tests {
             &sample("sample", "Original question?"),
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("short batch should still parse");
@@ -733,12 +877,73 @@ mod tests {
             &sample("sample", "Original question?"),
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("valid candidates should survive local rejection");
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].user, "New question?");
         assert_eq!(batch.rejected_reasons.len(), 1);
+    }
+
+    #[test]
+    fn parse_generated_items_rejects_final_only_when_source_requires_cot() {
+        let source = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original math question with visible reasoning format?".to_owned(),
+            source_meta: json!({"cot_mode": "CoT"}),
+        };
+        let text = json!({
+            "items": [{
+                "user": "A sequence starts at 4 and increases by 3 each step. What is the 9th term?",
+                "answer": "28",
+                "meta": {"answer_style": "final_only"}
+            }]
+        })
+        .to_string();
+
+        let batch = parse_generated_items(
+            &text,
+            &source,
+            TaskKind::Math,
+            AnswerCheckMode::ExactText,
+            AnswerStyle::Cot,
+            "unit",
+        )
+        .expect("batch should parse with rejected candidate");
+
+        assert!(batch.items.is_empty());
+        assert!(batch.rejected_reasons[0].contains("answer_style drift"));
+    }
+
+    #[test]
+    fn parse_generated_items_accepts_cot_when_source_requires_cot() {
+        let source = SourceSample {
+            sample_id: "sample".to_owned(),
+            source_user: "Original math question with visible reasoning format?".to_owned(),
+            source_meta: json!({"cot_mode": "CoT"}),
+        };
+        let text = json!({
+            "items": [{
+                "user": "A sequence starts at 4 and increases by 3 each step. What is the 9th term?",
+                "answer": "<think>The 9th term is 4 + 8 * 3 = 28.</think>\n28"
+            }]
+        })
+        .to_string();
+
+        let batch = parse_generated_items(
+            &text,
+            &source,
+            TaskKind::Math,
+            AnswerCheckMode::ExactText,
+            AnswerStyle::Cot,
+            "unit",
+        )
+        .expect("batch should parse");
+
+        assert_eq!(batch.items.len(), 1);
+        assert!(batch.rejected_reasons.is_empty());
+        assert!(batch.items[0].item_json.contains(r#""answer_style":"cot""#));
     }
 
     #[test]
@@ -755,6 +960,7 @@ mod tests {
             &sample("sample", "Original question?"),
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("duplicates are filtered after parsing");
@@ -782,6 +988,7 @@ mod tests {
                 &original,
                 TaskKind::Knowledge,
                 AnswerCheckMode::SingleLabel,
+                AnswerStyle::FinalOnly,
                 "unit"
             )
             .expect_err("assistant prompt should fail")
@@ -800,6 +1007,7 @@ mod tests {
                 &original,
                 TaskKind::Knowledge,
                 AnswerCheckMode::SingleLabel,
+                AnswerStyle::FinalOnly,
                 "unit"
             )
             .expect_err("identical prompt should fail")
@@ -825,6 +1033,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("same ref_answer should fail");
@@ -851,6 +1060,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("same letter with changed option content should pass");
@@ -876,6 +1086,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("same letter with same option content should fail");
@@ -901,6 +1112,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("duplicate option text should fail");
@@ -926,6 +1138,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("missing answer label should fail");
@@ -951,6 +1164,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("changed label set should fail");
@@ -975,6 +1189,7 @@ mod tests {
             &original,
             TaskKind::Coding,
             AnswerCheckMode::Disabled,
+            AnswerStyle::Code,
             "coding",
         )
         .expect("coding task should not require option labels");
@@ -1005,6 +1220,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect("same J letter with changed option content should pass");
@@ -1021,6 +1237,7 @@ mod tests {
             &original,
             TaskKind::Knowledge,
             AnswerCheckMode::SingleLabel,
+            AnswerStyle::FinalOnly,
             "unit",
         )
         .expect_err("same J letter with same option content should fail");

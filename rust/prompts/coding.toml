@@ -1,6 +1,7 @@
 name = "coding"
 task_kind = "coding"
 answer_check = "disabled"
+answer_style = "code"
 
 [synthesis]
 strategy = "subspace_contract_diversity"
@@ -22,7 +23,8 @@ template = '''
 2. 优先改变边界条件、错误处理、排序/去重规则、输入约束、复杂度目标或 API 契约。
 3. answer 写标准代码、补丁要点、SQL、输出或结论，必须符合题面要求。
 4. 不要引入未给出的文件、依赖、数据库 schema、网络请求或框架上下文。
-5. meta 必须包含 task_kind、language、skill_node、semantic_plan、changed_factor、edge_case、validation_contract、diversity_signature。
+5. 输出契约必须继承原题：代码题输出代码，补丁题输出补丁要点，final-only 题不能改成解释型答案；除非 answer_style=cot，否则不要输出思维链、<think> 或逐步推理。
+6. meta 必须包含 task_kind、answer_style、language、skill_node、semantic_plan、changed_factor、edge_case、validation_contract、cluster_key、diversity_signature。
 
 合成策略参考：
 {{synthesis_profile_json}}
@@ -48,9 +50,10 @@ template = '''
 valid=true 的条件：
 1. 任务类型、语言、接口和输入输出风格保持一致。
 2. 改变因素是真正影响实现或输出的条件。
-3. answer 与题面匹配，不依赖隐藏文件或外部系统。
-4. 样本包含足够上下文，可独立回答。
-5. 不存在明显无法运行、双解或未定义行为。
+3. answer_style 与题面输出契约一致，不能把短答案改成解释型，也不能在非 CoT 样本里输出思维链。
+4. answer 与题面匹配，不依赖隐藏文件或外部系统。
+5. 样本包含足够上下文，可独立回答。
+6. 不存在明显无法运行、双解或未定义行为。
 
 原始样本：
 {{source_sample_json}}

@@ -1,0 +1,26 @@
+{
+  "experiment": "second_round_100_20260630",
+  "train_path": "data/experiments/second_round_100_20260630/final/train_100.jsonl",
+  "tasks_path": "data/experiments/second_round_100_20260630/final/train_100_tasks.jsonl",
+  "raw_generated_tasks_path": "data/experiments/second_round_100_20260630/python_run_real100/generate/tasks.jsonl",
+  "source_input_path": "data/experiments/second_round_100_20260630/input/sources_20_balanced.jsonl",
+  "total": 100,
+  "domain_counts": {
+    "coding": 20,
+    "knowledge": 20,
+    "math": 20,
+    "instruction_following": 20,
+    "function_calling": 20
+  },
+  "task_domain_counts": {
+    "coding": 20,
+    "knowledge": 20,
+    "math": 20,
+    "instruction_following": 20,
+    "function_calling": 20
+  },
+  "source_raw_fields_in_final_meta": [],
+  "duplicate_diversity_signatures": {},
+  "issue_count": 0,
+  "issues": []
+}

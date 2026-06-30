@@ -1,0 +1,147 @@
+{
+  "experiment": "second_round_100_20260630",
+  "replaced_count": 20,
+  "reason": "The generated knowledge block repeated FM modulation variants and included duplicate prompts with conflicting answers, so all 20 knowledge rows were replaced by stable curated self-contained knowledge items.",
+  "repairs": [
+    {
+      "index": 20,
+      "task_id": "second_round_100_020_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 150 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 6",
+      "new_skill_node": "organelle_function",
+      "new_answer": "B"
+    },
+    {
+      "index": 21,
+      "task_id": "second_round_100_021_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 100 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 6",
+      "new_skill_node": "proportional_reasoning",
+      "new_answer": "B"
+    },
+    {
+      "index": 22,
+      "task_id": "second_round_100_022_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 112.5 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD.",
+      "new_skill_node": "classification",
+      "new_answer": "A"
+    },
+    {
+      "index": 23,
+      "task_id": "second_round_100_023_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 112.5 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD.",
+      "new_skill_node": "geologic_process",
+      "new_answer": "C"
+    },
+    {
+      "index": 24,
+      "task_id": "second_round_100_024_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 93.75 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD.",
+      "new_skill_node": "key_term",
+      "new_answer": "B"
+    },
+    {
+      "index": 25,
+      "task_id": "second_round_100_025_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz. If the maximum frequency deviation is 90 kHz, find the percentage modulation of the signal.\nA. 125%\nB. 1",
+      "new_skill_node": "standard_fact",
+      "new_answer": "C"
+    },
+    {
+      "index": 26,
+      "task_id": "second_round_100_026_knowledge",
+      "old_user_preview": "An FM broadcast station is assigned a carrier frequency of 101.5 MHz. The maximum allowed frequency deviation is 75 kHz. If the station's modulating signal causes a carrier swing o",
+      "new_skill_node": "unit_identification",
+      "new_answer": "C"
+    },
+    {
+      "index": 27,
+      "task_id": "second_round_100_027_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 100 kHz. Find the percentage modulation of the signal.\nA. 66.7%\nB. 83.3%\nC. 100%\nD",
+      "new_skill_node": "stable_cultural_knowledge",
+      "new_answer": "B"
+    },
+    {
+      "index": 28,
+      "task_id": "second_round_100_028_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with maximum frequency deviation of 50 kHz. Find the percentage modulation of the signal.\nA. 66.7%\nB. 33",
+      "new_skill_node": "date_recognition",
+      "new_answer": "B"
+    },
+    {
+      "index": 29,
+      "task_id": "second_round_100_029_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with maximum frequency deviation of 82.5 kHz. If the standard maximum deviation for FM broadcasting is 7",
+      "new_skill_node": "stable_location_fact",
+      "new_answer": "C"
+    },
+    {
+      "index": 30,
+      "task_id": "second_round_100_030_knowledge",
+      "old_user_preview": "What is the modulation index of a commercial FM broadcast signal with a carrier frequency deviation of 75 kHz if the maximum modulating frequency is 15 kHz?\nA. 2.5\nB. 3.33\nC. 5\nD. ",
+      "new_skill_node": "symbol_mapping",
+      "new_answer": "C"
+    },
+    {
+      "index": 31,
+      "task_id": "second_round_100_031_knowledge",
+      "old_user_preview": "An FM radio station broadcasts at a carrier frequency of 100 MHz. The maximum frequency deviation allowed is 75 kHz. If the highest modulating audio frequency is 5 kHz, what is the",
+      "new_skill_node": "size_comparison",
+      "new_answer": "C"
+    },
+    {
+      "index": 32,
+      "task_id": "second_round_100_032_knowledge",
+      "old_user_preview": "An FM broadcast station operates with a carrier swing of 150 kHz. If the highest audio frequency to be transmitted is 20 kHz, what is the modulation index?\nA. 5\nB. 7.5\nC. 10\nD. 12.",
+      "new_skill_node": "compare_contrast",
+      "new_answer": "B"
+    },
+    {
+      "index": 33,
+      "task_id": "second_round_100_033_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 125 kHz. If the maximum allowable frequency deviation is 75 kHz, find the modulati",
+      "new_skill_node": "wave_classification",
+      "new_answer": "A"
+    },
+    {
+      "index": 34,
+      "task_id": "second_round_100_034_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with a maximum frequency deviation of 75 kHz. If the highest modulating frequency is 15 kHz, find the mo",
+      "new_skill_node": "layer_identification",
+      "new_answer": "B"
+    },
+    {
+      "index": 35,
+      "task_id": "second_round_100_035_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 150 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 6",
+      "new_skill_node": "mechanism",
+      "new_answer": "B"
+    },
+    {
+      "index": 36,
+      "task_id": "second_round_100_036_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 100 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 6",
+      "new_skill_node": "causal_reasoning",
+      "new_answer": "A"
+    },
+    {
+      "index": 37,
+      "task_id": "second_round_100_037_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 200 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 6",
+      "new_skill_node": "technical_fact",
+      "new_answer": "B"
+    },
+    {
+      "index": 38,
+      "task_id": "second_round_100_038_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 75 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 62",
+      "new_skill_node": "cause_effect",
+      "new_answer": "A"
+    },
+    {
+      "index": 39,
+      "task_id": "second_round_100_039_knowledge",
+      "old_user_preview": "The frequency range of a commercially broadcast FM signal is 88 to 108 MHz, with carrier swing of 80 kHz. Find the percentage modulation of the signal.\nA. 110%\nB. 125%\nC. 50%\nD. 62",
+      "new_skill_node": "medical_basic_fact",
+      "new_answer": "C"
+    }
+  ]
+}
